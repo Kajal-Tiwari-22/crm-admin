@@ -1,0 +1,13 @@
+
+# Dependencies
+node_modules/
+
+# Environment variables and secrets
+.env
+.env.local
+.env.*.local
+
+# Build output
+.next/
+dist/
+build/
