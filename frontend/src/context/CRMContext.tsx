@@ -261,12 +261,13 @@ export function CRMProvider({ children }: { children: ReactNode }) {
     // 2. Fetch live data from MongoDB Atlas
     pullDatabaseFromMongoDB().then(res => {
       if (res.success && res.data) {
+        const fetchedData = res.data;
         setDb(prev => {
           const base = prev || loadDatabase();
           return {
             ...base,
-            ...res.data,
-            staff: (res.data.staff && res.data.staff.length > 0) ? res.data.staff : base.staff
+            ...fetchedData,
+            staff: (fetchedData.staff && fetchedData.staff.length > 0) ? fetchedData.staff : base.staff
           };
         });
         setIsMongoConnected(true);
