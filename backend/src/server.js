@@ -5,7 +5,7 @@ const cors = require('cors');
 const { Server } = require('socket.io');
 const connectDB = require('./config/db');
 const {
-  Vehicle, Customer, Sale, ServiceRecord, EMISchedule,
+  Vehicle, InventoryBatch, Customer, Sale, ServiceRecord, EMISchedule,
   Reminder, Lead, SparePart, Supplier, PurchaseOrder,
   WarrantyInsurance, Expense, Settings, AuditLog
 } = require('./models');
@@ -38,11 +38,12 @@ app.use((req, res, next) => {
 async function broadcastFullSync() {
   try {
     const [
-      vehicles, customers, sales, services, emiSchedules,
+      vehicles, inventoryBatches, customers, sales, services, emiSchedules,
       reminders, leads, spareParts, suppliers, purchaseOrders,
       warrantyInsurance, expenses, settings, auditLogs
     ] = await Promise.all([
       Vehicle.find().sort({ createdAt: -1 }),
+      InventoryBatch.find().sort({ createdAt: -1 }),
       Customer.find().sort({ createdAt: -1 }),
       Sale.find().sort({ createdAt: -1 }),
       ServiceRecord.find().sort({ createdAt: -1 }),
@@ -59,7 +60,7 @@ async function broadcastFullSync() {
     ]);
 
     const fullDb = {
-      vehicles, customers, sales, services, emiSchedules,
+      vehicles, inventoryBatches, customers, sales, services, emiSchedules,
       reminders, leads, spareParts, suppliers, purchaseOrders,
       warrantyInsurance, expenses,
       settings: settings || seedData.initialSettings,
@@ -108,11 +109,12 @@ app.get('/api/health', (req, res) => {
 app.get('/api/all', async (req, res) => {
   try {
     const [
-      vehicles, customers, sales, services, emiSchedules,
+      vehicles, inventoryBatches, customers, sales, services, emiSchedules,
       reminders, leads, spareParts, suppliers, purchaseOrders,
       warrantyInsurance, expenses, settings, auditLogs
     ] = await Promise.all([
       Vehicle.find().sort({ createdAt: -1 }),
+      InventoryBatch.find().sort({ createdAt: -1 }),
       Customer.find().sort({ createdAt: -1 }),
       Sale.find().sort({ createdAt: -1 }),
       ServiceRecord.find().sort({ createdAt: -1 }),
@@ -131,7 +133,7 @@ app.get('/api/all', async (req, res) => {
     res.json({
       success: true,
       data: {
-        vehicles, customers, sales, services, emiSchedules,
+        vehicles, inventoryBatches, customers, sales, services, emiSchedules,
         reminders, leads, spareParts, suppliers, purchaseOrders,
         warrantyInsurance, expenses,
         settings: settings || seedData.initialSettings,
@@ -254,7 +256,7 @@ app.post('/api/sync-push', async (req, res) => {
 });
 
 // ==========================================
-// VEHICLES (INVENTORY)
+// VEHICLES (INDIVIDUAL UNITS)
 // ==========================================
 app.get('/api/vehicles', async (req, res) => {
   const vehicles = await Vehicle.find().sort({ createdAt: -1 });
@@ -263,12 +265,20 @@ app.get('/api/vehicles', async (req, res) => {
 
 app.post('/api/vehicles', async (req, res) => {
   try {
-    const existing = await Vehicle.findOne({ chassisVin: req.body.chassisVin.trim().toUpperCase() });
+    const vin = (req.body.chassisVin || '').trim().toUpperCase();
+    if (!vin) return res.status(400).json({ success: false, message: 'Chassis number is required.' });
+    const existing = await Vehicle.findOne({ chassisVin: vin });
     if (existing) {
-      return res.status(400).json({ success: false, message: `Chassis/VIN ${req.body.chassisVin} already exists!` });
+      return res.status(400).json({ success: false, message: `Chassis/VIN "${vin}" already exists in inventory!` });
+    }
+    if (req.body.batterySerial) {
+      const bsExisting = await Vehicle.findOne({ batterySerial: req.body.batterySerial.trim().toUpperCase() });
+      if (bsExisting) {
+        return res.status(400).json({ success: false, message: `Battery serial "${req.body.batterySerial}" already assigned to another unit!` });
+      }
     }
     const newId = req.body.id || `veh-${Date.now().toString().slice(-5)}`;
-    const vehicle = new Vehicle({ ...req.body, id: newId });
+    const vehicle = new Vehicle({ ...req.body, chassisVin: vin, id: newId });
     await vehicle.save();
     
     io.emit('db_update', { collection: 'vehicles', action: 'create', data: vehicle });
@@ -292,10 +302,338 @@ app.put('/api/vehicles/:id', async (req, res) => {
 
 app.delete('/api/vehicles/:id', async (req, res) => {
   try {
+    const veh = await Vehicle.findOne({ id: req.params.id });
+    if (veh && veh.status === 'Sold') {
+      return res.status(400).json({ success: false, message: 'Cannot delete a sold unit. Archive the batch instead.' });
+    }
     await Vehicle.findOneAndDelete({ id: req.params.id });
     io.emit('db_update', { collection: 'vehicles', action: 'delete', data: { id: req.params.id } });
     await broadcastFullSync();
     res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ==========================================
+// INVENTORY BATCHES (PURCHASE LOTS)
+// ==========================================
+app.get('/api/inventory-batches', async (req, res) => {
+  try {
+    const batches = await InventoryBatch.find().sort({ createdAt: -1 });
+    res.json({ success: true, data: batches });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Create a new inventory batch (with individual unit chassis/battery entries)
+app.post('/api/inventory-batches', async (req, res) => {
+  try {
+    const {
+      modelNumber, lightType, companyName, batteryCompanyName,
+      hsnCode, purchaseDate, purchaseCostPerUnit, quantity,
+      invoiceNumber, supplierName, batteryWarrantyMonths, stockNotes,
+      units = []  // array of { chassisNumber, batterySerial, color, motorNumber }
+    } = req.body;
+
+    // Server-side validation
+    if (!modelNumber || !modelNumber.trim()) {
+      return res.status(400).json({ success: false, message: 'Model number is required.' });
+    }
+    if (!companyName || !companyName.trim()) {
+      return res.status(400).json({ success: false, message: 'Company name is required.' });
+    }
+    if (!purchaseDate) {
+      return res.status(400).json({ success: false, message: 'Purchase date is required.' });
+    }
+    if (!purchaseCostPerUnit || purchaseCostPerUnit < 0) {
+      return res.status(400).json({ success: false, message: 'Purchase cost must be a non-negative number.' });
+    }
+    if (!quantity || quantity < 1 || !Number.isInteger(Number(quantity))) {
+      return res.status(400).json({ success: false, message: 'Quantity must be a positive whole number.' });
+    }
+
+    // Check for duplicate chassis / battery serials before creating anything
+    for (const unit of units) {
+      if (unit.chassisNumber) {
+        const vin = unit.chassisNumber.trim().toUpperCase();
+        const vinExists = await Vehicle.findOne({ chassisVin: vin });
+        if (vinExists) {
+          return res.status(400).json({ success: false, message: `Chassis number "${vin}" already exists in inventory!` });
+        }
+      }
+      if (unit.batterySerial) {
+        const bs = unit.batterySerial.trim().toUpperCase();
+        const bsExists = await Vehicle.findOne({ batterySerial: bs });
+        if (bsExists) {
+          return res.status(400).json({ success: false, message: `Battery serial "${bs}" is already assigned to another unit!` });
+        }
+      }
+    }
+
+    // Generate batch
+    const batchCount = await InventoryBatch.countDocuments();
+    const batchCode = `BATCH-${new Date().getFullYear()}-${String(batchCount + 1).padStart(3, '0')}`;
+    const batchId = `batch-${Date.now()}`;
+
+    // Create individual Vehicle documents for each unit
+    const createdVehicleIds = [];
+    for (let i = 0; i < Number(quantity); i++) {
+      const unit = units[i] || {};
+      const vin = (unit.chassisNumber || '').trim().toUpperCase();
+      const bs = (unit.batterySerial || '').trim().toUpperCase();
+      const vehId = `veh-${Date.now()}-${i}`;
+
+      if (vin) {
+        const veh = new Vehicle({
+          id: vehId,
+          brand: companyName.trim(),
+          model: modelNumber.trim(),
+          modelNumber: modelNumber.trim(),
+          variant: '',
+          color: unit.color || '',
+          lightType: lightType || 'Single Light',
+          companyName: companyName.trim(),
+          batteryCompanyName: batteryCompanyName || '',
+          hsnCode: hsnCode || '',
+          chassisVin: vin,
+          motorNumber: (unit.motorNumber || '').trim().toUpperCase(),
+          batterySerial: bs,
+          purchasePrice: Number(purchaseCostPerUnit),
+          purchaseDate: purchaseDate,
+          supplierInvoiceNo: invoiceNumber || '',
+          batteryWarrantyMonths: Number(batteryWarrantyMonths) || 36,
+          inventoryBatchId: batchId,
+          status: 'Available',
+          location: 'Showroom Floor'
+        });
+        await veh.save();
+        createdVehicleIds.push(vehId);
+      }
+    }
+
+    const batch = new InventoryBatch({
+      id: batchId,
+      batchCode,
+      modelNumber: modelNumber.trim(),
+      lightType: lightType || 'Single Light',
+      companyName: companyName.trim(),
+      batteryCompanyName: batteryCompanyName || '',
+      hsnCode: hsnCode || '',
+      purchaseDate,
+      purchaseCostPerUnit: Number(purchaseCostPerUnit),
+      quantity: Number(quantity),
+      availableQty: createdVehicleIds.length > 0 ? createdVehicleIds.length : Number(quantity),
+      soldQty: 0,
+      invoiceNumber: invoiceNumber || '',
+      supplierName: supplierName || '',
+      batteryWarrantyMonths: Number(batteryWarrantyMonths) || 36,
+      stockNotes: stockNotes || '',
+      status: 'Active',
+      unitIds: createdVehicleIds
+    });
+    await batch.save();
+
+    // Audit log
+    await AuditLog.create({
+      id: `aud-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      userName: 'Admin',
+      userRole: 'Owner',
+      action: 'ADD_INVENTORY_BATCH',
+      module: 'Inventory',
+      details: `Added batch ${batchCode}: ${quantity}x ${modelNumber} from ${companyName}. Purchase cost: ₹${purchaseCostPerUnit}/unit.`
+    });
+
+    io.emit('db_update', { collection: 'inventoryBatches', action: 'create', data: batch });
+    await broadcastFullSync();
+    res.status(201).json({ success: true, data: batch, message: `Inventory batch ${batchCode} created with ${quantity} units.` });
+  } catch (err) {
+    console.error('[Inventory Batch] Create error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Get single batch with its units
+app.get('/api/inventory-batches/:id', async (req, res) => {
+  try {
+    const batch = await InventoryBatch.findOne({ id: req.params.id });
+    if (!batch) return res.status(404).json({ success: false, message: 'Batch not found.' });
+    const units = await Vehicle.find({ inventoryBatchId: req.params.id }).sort({ createdAt: 1 });
+    res.json({ success: true, data: { batch, units } });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Update inventory batch metadata
+app.put('/api/inventory-batches/:id', async (req, res) => {
+  try {
+    const {
+      modelNumber, lightType, companyName, batteryCompanyName,
+      hsnCode, purchaseDate, purchaseCostPerUnit, invoiceNumber,
+      supplierName, batteryWarrantyMonths, stockNotes
+    } = req.body;
+
+    if (!modelNumber || !companyName || !purchaseDate || purchaseCostPerUnit < 0) {
+      return res.status(400).json({ success: false, message: 'Model, company, purchase date, and cost are required.' });
+    }
+
+    const updated = await InventoryBatch.findOneAndUpdate(
+      { id: req.params.id },
+      { modelNumber, lightType, companyName, batteryCompanyName, hsnCode, purchaseDate, purchaseCostPerUnit, invoiceNumber, supplierName, batteryWarrantyMonths, stockNotes },
+      { new: true }
+    );
+    if (!updated) return res.status(404).json({ success: false, message: 'Batch not found.' });
+
+    // Sync vehicle records with updated batch metadata
+    await Vehicle.updateMany(
+      { inventoryBatchId: req.params.id },
+      { model: modelNumber, modelNumber, companyName, batteryCompanyName, hsnCode, lightType, purchaseDate, purchasePrice: purchaseCostPerUnit, batteryWarrantyMonths }
+    );
+
+    await AuditLog.create({
+      id: `aud-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      userName: 'Admin',
+      userRole: 'Owner',
+      action: 'UPDATE_INVENTORY_BATCH',
+      module: 'Inventory',
+      details: `Updated batch ${req.params.id}: ${modelNumber} from ${companyName}.`
+    });
+
+    io.emit('db_update', { collection: 'inventoryBatches', action: 'update', data: updated });
+    await broadcastFullSync();
+    res.json({ success: true, data: updated });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Delete / archive a batch
+app.delete('/api/inventory-batches/:id', async (req, res) => {
+  try {
+    const batch = await InventoryBatch.findOne({ id: req.params.id });
+    if (!batch) return res.status(404).json({ success: false, message: 'Batch not found.' });
+
+    // Check if any units are sold
+    const soldUnits = await Vehicle.countDocuments({ inventoryBatchId: req.params.id, status: 'Sold' });
+    if (soldUnits > 0) {
+      // Soft delete — archive instead of hard delete
+      const archived = await InventoryBatch.findOneAndUpdate(
+        { id: req.params.id },
+        { status: 'Archived' },
+        { new: true }
+      );
+      await AuditLog.create({
+        id: `aud-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        userName: 'Admin',
+        userRole: 'Owner',
+        action: 'ARCHIVE_INVENTORY_BATCH',
+        module: 'Inventory',
+        details: `Archived batch ${req.params.id} (${soldUnits} units were sold — preserved for audit trail).`
+      });
+      io.emit('db_update', { collection: 'inventoryBatches', action: 'update', data: archived });
+      await broadcastFullSync();
+      return res.json({ success: true, archived: true, message: `Batch archived (${soldUnits} sold units preserved in audit trail).` });
+    }
+
+    // Hard delete available units
+    await Vehicle.deleteMany({ inventoryBatchId: req.params.id, status: { $ne: 'Sold' } });
+    await InventoryBatch.findOneAndDelete({ id: req.params.id });
+
+    await AuditLog.create({
+      id: `aud-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      userName: 'Admin',
+      userRole: 'Owner',
+      action: 'DELETE_INVENTORY_BATCH',
+      module: 'Inventory',
+      details: `Deleted batch ${req.params.id} and its unsold units.`
+    });
+
+    io.emit('db_update', { collection: 'inventoryBatches', action: 'delete', data: { id: req.params.id } });
+    await broadcastFullSync();
+    res.json({ success: true, archived: false, message: 'Batch and all unsold units deleted successfully.' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Add more units to an existing batch
+app.post('/api/inventory-batches/:id/add-units', async (req, res) => {
+  try {
+    const { units = [] } = req.body;
+    const batch = await InventoryBatch.findOne({ id: req.params.id });
+    if (!batch) return res.status(404).json({ success: false, message: 'Batch not found.' });
+
+    if (!units.length) return res.status(400).json({ success: false, message: 'No units provided.' });
+
+    const newVehicleIds = [];
+    for (let i = 0; i < units.length; i++) {
+      const unit = units[i];
+      const vin = (unit.chassisNumber || '').trim().toUpperCase();
+      if (!vin) continue;
+      const vinExists = await Vehicle.findOne({ chassisVin: vin });
+      if (vinExists) {
+        return res.status(400).json({ success: false, message: `Chassis number "${vin}" already exists!` });
+      }
+      const bs = (unit.batterySerial || '').trim().toUpperCase();
+      if (bs) {
+        const bsExists = await Vehicle.findOne({ batterySerial: bs });
+        if (bsExists) {
+          return res.status(400).json({ success: false, message: `Battery serial "${bs}" is already assigned!` });
+        }
+      }
+      const vehId = `veh-${Date.now()}-${i}`;
+      const veh = new Vehicle({
+        id: vehId,
+        brand: batch.companyName,
+        model: batch.modelNumber,
+        modelNumber: batch.modelNumber,
+        color: unit.color || '',
+        lightType: batch.lightType,
+        companyName: batch.companyName,
+        batteryCompanyName: batch.batteryCompanyName,
+        hsnCode: batch.hsnCode,
+        chassisVin: vin,
+        batterySerial: bs,
+        motorNumber: (unit.motorNumber || '').trim().toUpperCase(),
+        purchasePrice: batch.purchaseCostPerUnit,
+        purchaseDate: batch.purchaseDate,
+        batteryWarrantyMonths: batch.batteryWarrantyMonths,
+        inventoryBatchId: batch.id,
+        status: 'Available',
+        location: 'Showroom Floor'
+      });
+      await veh.save();
+      newVehicleIds.push(vehId);
+    }
+
+    const updatedBatch = await InventoryBatch.findOneAndUpdate(
+      { id: req.params.id },
+      {
+        $inc: { quantity: newVehicleIds.length, availableQty: newVehicleIds.length },
+        $push: { unitIds: { $each: newVehicleIds } }
+      },
+      { new: true }
+    );
+
+    await AuditLog.create({
+      id: `aud-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      userName: 'Admin',
+      userRole: 'Owner',
+      action: 'ADD_UNITS_TO_BATCH',
+      module: 'Inventory',
+      details: `Added ${newVehicleIds.length} new unit(s) to batch ${batch.batchCode} (${batch.modelNumber}).`
+    });
+
+    io.emit('db_update', { collection: 'inventoryBatches', action: 'update', data: updatedBatch });
+    await broadcastFullSync();
+    res.json({ success: true, data: updatedBatch, addedCount: newVehicleIds.length });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

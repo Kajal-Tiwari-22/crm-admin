@@ -6,7 +6,8 @@ import {
   Vehicle, Customer, CustomerDocument, Sale, ServiceRecord, EMISchedule,
   Reminder, Lead, SparePart, Supplier, PurchaseOrder,
   WarrantyInsurance, Expense, StaffUser, StaffRole,
-  AuditLog, ShowroomSettings, ServiceStatus, InstallmentStatus
+  AuditLog, ShowroomSettings, ServiceStatus, InstallmentStatus,
+  InventoryBatch, InventoryUnit
 } from '@/types/crm';
 import {
   CRMDatabase, loadDatabase, saveDatabase, resetDatabaseToDefault, loadSampleDemoData
@@ -39,6 +40,7 @@ interface CRMContextType {
 
   // Data
   vehicles: Vehicle[];
+  inventoryBatches: InventoryBatch[];
   customers: Customer[];
   sales: Sale[];
   services: ServiceRecord[];
@@ -77,6 +79,26 @@ interface CRMContextType {
   addVehicle: (vehicleData: Omit<Vehicle, 'id' | 'createdAt'>) => { success: boolean; message?: string };
   updateVehicle: (id: string, updates: Partial<Vehicle>) => void;
   deleteVehicle: (id: string) => void;
+
+  // Inventory Batch Actions (direct API calls)
+  addInventoryBatch: (batchData: {
+    modelNumber: string;
+    lightType: string;
+    companyName: string;
+    batteryCompanyName: string;
+    hsnCode: string;
+    purchaseDate: string;
+    purchaseCostPerUnit: number;
+    quantity: number;
+    invoiceNumber?: string;
+    supplierName?: string;
+    batteryWarrantyMonths?: number;
+    stockNotes?: string;
+    units: InventoryUnit[];
+  }) => Promise<{ success: boolean; message?: string; data?: InventoryBatch }>;
+  updateInventoryBatch: (id: string, updates: Partial<InventoryBatch>) => Promise<{ success: boolean; message?: string }>;
+  deleteInventoryBatch: (id: string) => Promise<{ success: boolean; message?: string; archived?: boolean }>;
+  addUnitsToInventoryBatch: (batchId: string, units: InventoryUnit[]) => Promise<{ success: boolean; message?: string }>;
   
   addCustomer: (custData: Omit<Customer, 'id' | 'createdAt' | 'customerCode'>) => Customer;
   updateCustomer: (id: string, updates: Partial<Customer>) => void;
@@ -295,6 +317,12 @@ export function CRMProvider({ children }: { children: ReactNode }) {
               if (action === 'update') return { ...prev, vehicles: prev.vehicles.map(v => v.id === data.id ? data : v) };
               if (action === 'delete') return { ...prev, vehicles: prev.vehicles.filter(v => v.id !== data.id) };
             }
+            if (collection === 'inventoryBatches') {
+              const batches = prev.inventoryBatches || [];
+              if (action === 'create') return { ...prev, inventoryBatches: [data, ...batches.filter((b: any) => b.id !== data.id)] };
+              if (action === 'update') return { ...prev, inventoryBatches: batches.map((b: any) => b.id === data.id ? data : b) };
+              if (action === 'delete') return { ...prev, inventoryBatches: batches.filter((b: any) => b.id !== data.id) };
+            }
             if (collection === 'customers') {
               if (action === 'create') return { ...prev, customers: [data, ...prev.customers.filter(c => c.id !== data.id)] };
               if (action === 'update') return { ...prev, customers: prev.customers.map(c => c.id === data.id ? data : c) };
@@ -419,6 +447,71 @@ export function CRMProvider({ children }: { children: ReactNode }) {
       };
     });
     addAuditLog('DELETE_VEHICLE', 'Inventory', `Removed vehicle ID: ${id}`);
+  };
+
+  // 1b. Inventory Batch Actions — direct API calls to backend
+  const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000';
+
+  const addInventoryBatch = async (batchData: {
+    modelNumber: string; lightType: string; companyName: string;
+    batteryCompanyName: string; hsnCode: string; purchaseDate: string;
+    purchaseCostPerUnit: number; quantity: number; invoiceNumber?: string;
+    supplierName?: string; batteryWarrantyMonths?: number; stockNotes?: string;
+    units: InventoryUnit[];
+  }): Promise<{ success: boolean; message?: string; data?: InventoryBatch }> => {
+    try {
+      const res = await fetch(`${BACKEND}/api/inventory-batches`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(batchData)
+      });
+      const json = await res.json();
+      if (json.success) {
+        // State will be updated via socket sync_data event
+        return { success: true, message: json.message, data: json.data };
+      }
+      return { success: false, message: json.message || 'Failed to add inventory batch.' };
+    } catch (err: any) {
+      return { success: false, message: err.message || 'Network error adding inventory batch.' };
+    }
+  };
+
+  const updateInventoryBatch = async (id: string, updates: Partial<InventoryBatch>): Promise<{ success: boolean; message?: string }> => {
+    try {
+      const res = await fetch(`${BACKEND}/api/inventory-batches/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates)
+      });
+      const json = await res.json();
+      return { success: json.success, message: json.message };
+    } catch (err: any) {
+      return { success: false, message: err.message };
+    }
+  };
+
+  const deleteInventoryBatch = async (id: string): Promise<{ success: boolean; message?: string; archived?: boolean }> => {
+    try {
+      const res = await fetch(`${BACKEND}/api/inventory-batches/${id}`, { method: 'DELETE' });
+      const json = await res.json();
+      return { success: json.success, message: json.message, archived: json.archived };
+    } catch (err: any) {
+      return { success: false, message: err.message };
+    }
+  };
+
+  const addUnitsToInventoryBatch = async (batchId: string, units: InventoryUnit[]): Promise<{ success: boolean; message?: string }> => {
+    try {
+      const res = await fetch(`${BACKEND}/api/inventory-batches/${batchId}/add-units`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ units })
+      });
+      const json = await res.json();
+      return { success: json.success, message: json.message };
+    } catch (err: any) {
+      return { success: false, message: err.message };
+    }
   };
 
   // 2. Customers
@@ -1295,6 +1388,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
         uploadSaleInvoice,
 
         vehicles: db.vehicles,
+        inventoryBatches: db.inventoryBatches || [],
         customers: db.customers,
         sales: db.sales,
         services: db.services,
@@ -1330,6 +1424,11 @@ export function CRMProvider({ children }: { children: ReactNode }) {
         addVehicle,
         updateVehicle,
         deleteVehicle,
+
+        addInventoryBatch,
+        updateInventoryBatch,
+        deleteInventoryBatch,
+        addUnitsToInventoryBatch,
 
         addCustomer,
         updateCustomer,

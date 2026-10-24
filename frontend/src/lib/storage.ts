@@ -1,7 +1,7 @@
 import {
   Vehicle, Customer, Sale, ServiceRecord, EMISchedule,
   Reminder, Lead, SparePart, Supplier, PurchaseOrder,
-  WarrantyInsurance, Expense, StaffUser, AuditLog, ShowroomSettings
+  WarrantyInsurance, Expense, StaffUser, AuditLog, ShowroomSettings, InventoryBatch
 } from '@/types/crm';
 import {
   initialVehicles, initialCustomers, initialSales, initialServices,
@@ -14,6 +14,7 @@ const STORAGE_KEY = 'EV_SHOWROOM_CRM_DB_CLEAN';
 
 export interface CRMDatabase {
   vehicles: Vehicle[];
+  inventoryBatches: InventoryBatch[];
   customers: Customer[];
   sales: Sale[];
   services: ServiceRecord[];
@@ -33,6 +34,7 @@ export interface CRMDatabase {
 export function getDefaultDatabase(): CRMDatabase {
   return {
     vehicles: [],
+    inventoryBatches: [],
     customers: [],
     sales: [],
     services: [],

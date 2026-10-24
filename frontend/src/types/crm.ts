@@ -1,20 +1,59 @@
 export type VehicleStatus = 'Available' | 'Reserved' | 'Sold' | 'In Transit' | 'Returned';
+export type LightType = 'Single Light' | 'Double Light';
+export type InventoryBatchStatus = 'Active' | 'Archived' | 'Out of Stock';
+
+// InventoryBatch — a purchase lot of scooters
+export interface InventoryUnit {
+  chassisNumber: string;
+  batterySerial: string;
+  color: string;
+  motorNumber?: string;
+}
+
+export interface InventoryBatch {
+  id: string;
+  batchCode: string;
+  modelNumber: string;
+  lightType: LightType;
+  companyName: string;
+  batteryCompanyName: string;
+  hsnCode: string;
+  purchaseDate: string;
+  purchaseCostPerUnit: number;
+  quantity: number;
+  availableQty: number;
+  soldQty: number;
+  invoiceNumber: string;
+  supplierName: string;
+  batteryWarrantyMonths: number;
+  stockNotes: string;
+  status: InventoryBatchStatus;
+  unitIds: string[];
+  createdAt: string;
+}
 
 export interface Vehicle {
   id: string;
   brand: string;
   model: string;
+  modelNumber?: string;
   variant: string;
   color: string;
+  // New EV inventory fields
+  lightType?: LightType;
+  companyName?: string;
+  batteryCompanyName?: string;
+  hsnCode?: string;
+  inventoryBatchId?: string;
   chassisVin: string;
   motorNumber: string;
   batterySerial: string;
   batteryCapacityKwh: number;
   certifiedRangeKm: number;
-  purchasePrice: number; // Ex-dealer cost
-  gstRate: number; // e.g. 5% for EVs in India
+  purchasePrice: number;
+  gstRate: number;
   gstAmount: number;
-  sellingPrice: number; // Ex-showroom price
+  sellingPrice: number;
   dealerMargin: number;
   purchaseDate: string;
   supplierId: string;
@@ -24,7 +63,7 @@ export interface Vehicle {
   vehicleWarrantyMonths: number;
   stockAgeDays: number;
   assignedCustomerId?: string;
-  location: string; // 'Showroom Floor' | 'Warehouse' | 'Service Bay'
+  location: string;
   createdAt: string;
 }
 

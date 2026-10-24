@@ -1,6 +1,29 @@
 const mongoose = require('mongoose');
 const { Schema } = mongoose;
 
+// InventoryBatch Schema — tracks a purchase batch of scooters
+const InventoryBatchSchema = new Schema({
+  id: { type: String, required: true, unique: true },
+  batchCode: { type: String, required: true },           // e.g. BATCH-2026-001
+  modelNumber: { type: String, required: true },          // e.g. E-Scoot 207
+  lightType: { type: String, enum: ['Single Light', 'Double Light'], default: 'Single Light' },
+  companyName: { type: String, required: true },          // Scooter manufacturer
+  batteryCompanyName: { type: String, default: '' },      // Battery manufacturer
+  hsnCode: { type: String, default: '' },                 // HSN code (preserve leading zeros as string)
+  purchaseDate: { type: String, required: true },         // ISO date string
+  purchaseCostPerUnit: { type: Number, required: true },  // Cost per unit in INR
+  quantity: { type: Number, required: true, min: 1 },     // Total units in this batch
+  availableQty: { type: Number, default: 0 },             // Units still in stock
+  soldQty: { type: Number, default: 0 },                  // Units sold
+  invoiceNumber: { type: String, default: '' },           // Purchase invoice ref
+  supplierName: { type: String, default: '' },            // Supplier / distributor
+  batteryWarrantyMonths: { type: Number, default: 36 },
+  stockNotes: { type: String, default: '' },
+  status: { type: String, enum: ['Active', 'Archived', 'Out of Stock'], default: 'Active' },
+  unitIds: { type: [String], default: [] },               // Array of Vehicle IDs in this batch
+  createdAt: { type: String, default: () => new Date().toISOString() }
+}, { timestamps: true, strict: false });
+
 // Vehicle Schema
 const VehicleSchema = new Schema({
   id: { type: String, required: true, unique: true },
@@ -8,6 +31,13 @@ const VehicleSchema = new Schema({
   model: { type: String, required: true },
   variant: { type: String, default: '' },
   color: { type: String, default: '' },
+  // New EV-specific inventory fields
+  lightType: { type: String, enum: ['Single Light', 'Double Light'], default: 'Single Light' },
+  companyName: { type: String, default: '' },
+  batteryCompanyName: { type: String, default: '' },
+  hsnCode: { type: String, default: '' },
+  inventoryBatchId: { type: String, default: '' },        // Links to InventoryBatch
+  modelNumber: { type: String, default: '' },             // e.g. E-Scoot 207
   chassisVin: { type: String, required: true, unique: true },
   motorNumber: { type: String, default: '' },
   batterySerial: { type: String, default: '' },
@@ -274,6 +304,7 @@ const AuditLogSchema = new Schema({
 
 module.exports = {
   Vehicle: mongoose.model('Vehicle', VehicleSchema),
+  InventoryBatch: mongoose.model('InventoryBatch', InventoryBatchSchema),
   Customer: mongoose.model('Customer', CustomerSchema),
   Sale: mongoose.model('Sale', SaleSchema),
   ServiceRecord: mongoose.model('ServiceRecord', ServiceRecordSchema),
