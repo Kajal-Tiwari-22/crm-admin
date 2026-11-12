@@ -1,6 +1,6 @@
 const path = require('path');
 const backendEnvPath = path.resolve(__dirname, '..', '.env');
-const envLoadResult = require('dotenv').config({ path: backendEnvPath, override: true });
+const envLoadResult = require('dotenv').config({ path: backendEnvPath });
 const http = require('http');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
@@ -18,7 +18,11 @@ const seedData = require('./data/seedData.cjs');
 const { authenticateAdmin, clearSessionCookie, createSessionCookie, isValidSession } = require('./services/auth');
 
 const FRONTEND_ORIGIN = new URL(
-  process.env.FRONTEND_ORIGIN || 'http://localhost:3000'
+  process.env.FRONTEND_ORIGIN || (
+    process.env.NODE_ENV === 'production'
+      ? 'https://crm-admin-jbo8.vercel.app'
+      : 'http://localhost:3000'
+  )
 ).origin;
 
 function getAuthConfigurationIssues() {
