@@ -86,6 +86,15 @@ export interface Customer {
   phone: string;
   email: string;
   address: string;
+  currentAddress?: string;
+  permanentAddress?: string;
+  guarantorRequired?: boolean;
+  guarantor?: {
+    name: string;
+    phone: string;
+    address: string;
+  };
+  archivedAt?: string | null;
   city: string;
   pincode: string;
   aadhaarNumber: string;
@@ -118,6 +127,27 @@ export interface Sale {
   financeCompanyName?: string; // e.g. 'IDFC FIRST Bank', 'HDFC Bank', 'L&T Finance'
   loanAccountRef?: string;
   financedAmount?: number;
+  paymentMethod?: 'Full Payment' | 'Finance Company EMI' | 'Showroom Installments';
+  modelNumber?: string;
+  companyName?: string;
+  chassisVin?: string;
+  batterySerial?: string;
+  purchaseCostSnapshot?: number;
+  finalSellingPrice?: number;
+  remainingAmount?: number;
+  financeStatus?: 'Pending' | 'Approved' | 'Rejected' | '';
+  firstDueDate?: string;
+  paymentDay?: number | null;
+  paymentFrequency?: string;
+  installmentSchedule?: EMIInstallment[];
+  paymentLedger?: {
+    amountDue: number;
+    amountPaid: number;
+    paymentDate: string;
+    paymentMethod: string;
+    reference: string;
+    outstandingBalance: number;
+  }[];
   pendingDocuments: string[];
   deliveryStatus: 'Pending' | 'Ready' | 'Delivered' | 'Handed Over';
   deliveryDate?: string;
@@ -203,6 +233,14 @@ export interface EMIInstallment {
   paymentMethod?: 'Cash' | 'UPI' | 'Bank Transfer' | 'Cheque';
   lateFee?: number;
   notes?: string;
+  outstandingBalance?: number;
+  payments?: {
+    amount: number;
+    paymentDate: string;
+    paymentMethod: 'Cash' | 'UPI' | 'Bank Transfer' | 'Cheque';
+    reference?: string;
+    receiptNumber: string;
+  }[];
 }
 
 export interface EMISchedule {

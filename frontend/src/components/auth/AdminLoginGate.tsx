@@ -35,19 +35,6 @@ export default function AdminLoginGate({ children }: { children: React.ReactNode
     }
   };
 
-  const handleQuickDemoLogin = async () => {
-    const demoEmail = process.env.NEXT_PUBLIC_ADMIN_EMAIL || 'admin@voltriderev.com';
-    const demoPass = process.env.NEXT_PUBLIC_ADMIN_PASSWORD || 'admin@123';
-    setEmail(demoEmail);
-    setPassword(demoPass);
-    setIsSubmitting(true);
-    const res = await loginAdmin(demoEmail, demoPass);
-    if (!res.success) {
-      setError(res.message || 'Login failed.');
-    }
-    setIsSubmitting(false);
-  };
-
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-indigo-950 flex flex-col justify-center items-center p-4 relative overflow-hidden">
       {/* Background glowing decorations */}
@@ -61,10 +48,10 @@ export default function AdminLoginGate({ children }: { children: React.ReactNode
             <Zap className="w-9 h-9 fill-current" />
           </div>
           <h1 className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">
-            VOLTRIDER <span className="text-emerald-400">EV CRM</span>
+            MOTORSHANDILYA <span className="text-emerald-400">EV CRM</span>
           </h1>
           <p className="text-slate-400 text-sm mt-1.5 font-medium">
-            Smart Dealership & Showroom Operating System
+            Owned and managed by Deen Dayak Tiwari
           </p>
         </div>
 
@@ -146,18 +133,9 @@ export default function AdminLoginGate({ children }: { children: React.ReactNode
             </button>
           </form>
 
-          {/* Quick One-Click Demo Login */}
           <div className="mt-5 pt-4 border-t border-slate-100 text-center">
-            <button
-              type="button"
-              onClick={handleQuickDemoLogin}
-              className="w-full py-2.5 px-3 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs transition-colors flex items-center justify-center gap-2"
-            >
-              <Zap className="w-3.5 h-3.5 text-amber-500 fill-amber-500" />
-              <span>Quick 1-Click Admin Access</span>
-            </button>
             <p className="text-[11px] text-slate-400 mt-2">
-              Credentials secured in <code className="text-emerald-600 font-mono">.env.local</code> (No hardcoded credentials)
+              Single administrator access · Secured by the CRM backend
             </p>
           </div>
         </div>

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { createContext, useContext, useState, useEffect, ReactNode, useMemo } from 'react';
+import React, { createContext, useContext, useState, useEffect, ReactNode, useMemo, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   Vehicle, Customer, CustomerDocument, Sale, ServiceRecord, EMISchedule,
@@ -10,7 +10,7 @@ import {
   InventoryBatch, InventoryUnit
 } from '@/types/crm';
 import {
-  CRMDatabase, loadDatabase, saveDatabase, resetDatabaseToDefault, loadSampleDemoData
+  CRMDatabase, getDefaultDatabase, loadDatabase, saveDatabase, resetDatabaseToDefault, loadSampleDemoData
 } from '@/lib/storage';
 import {
   pushDatabaseToMongoDB, pullDatabaseFromMongoDB, dispatchWhatsAppReminder, getMongoSocket, resetMongoDBDatabase, wipeCleanMongoDB
@@ -128,7 +128,7 @@ interface CRMContextType {
     // Optional EMI parameters if financing
     emiTenureMonths?: number;
     emiInterestRate?: number;
-  }) => { success: boolean; saleId?: string; message?: string };
+  }) => Promise<{ success: boolean; saleId?: string; message?: string }>;
 
   updateSaleDelivery: (saleId: string, deliveryStatus: Sale['deliveryStatus'], checklist?: Partial<Sale['deliveryChecklist']>) => void;
 
@@ -153,7 +153,7 @@ interface CRMContextType {
     paidAmount: number;
     paymentMethod: 'Cash' | 'UPI' | 'Bank Transfer' | 'Cheque';
     notes?: string;
-  }) => { success: boolean; receiptNumber: string };
+  }) => Promise<{ success: boolean; receiptNumber: string; message?: string }>;
 
   triggerReminderNotification: (reminderId: string, channel: 'Email' | 'SMS' | 'WhatsApp') => Promise<{ success: boolean; message: string }>;
   createCustomReminder: (reminderData: Omit<Reminder, 'id' | 'createdAt' | 'deliveryAttempts' | 'status'>) => void;
@@ -200,10 +200,14 @@ interface CRMContextType {
 }
 
 const CRMContext = createContext<CRMContextType | undefined>(undefined);
+const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000';
 
 export function CRMProvider({ children }: { children: ReactNode }) {
   const [db, setDb] = useState<CRMDatabase | null>(null);
+  const skipNextPush = useRef(false);
+  const [hasLoadedFromServer, setHasLoadedFromServer] = useState(false);
   const [currentRole, setCurrentRole] = useState<StaffRole>('Owner');
+  const [adminName, setAdminName] = useState('Deen Dayak Tiwari');
   const router = useRouter();
   const [activeTab, setActiveTabState] = useState<string>('dashboard');
 
@@ -231,38 +235,35 @@ export function CRMProvider({ children }: { children: ReactNode }) {
   const [selectedEMIForReceipt, setSelectedEMIForReceipt] = useState<{ emi: EMISchedule; installmentNo: number } | null>(null);
 
   // Authentication state
-  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
-    if (typeof window !== 'undefined') {
-      return localStorage.getItem('EV_CRM_ADMIN_AUTH') === 'true';
-    }
-    return false;
-  });
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
 
   const loginAdmin = async (email: string, pass: string): Promise<{ success: boolean; message?: string }> => {
-    const validEmail = (process.env.NEXT_PUBLIC_ADMIN_EMAIL || 'admin@voltriderev.com').trim().toLowerCase();
-    const validPass = process.env.NEXT_PUBLIC_ADMIN_PASSWORD || 'admin@123';
-    const inputEmail = email.trim().toLowerCase();
-
-    if (
-      (inputEmail === validEmail && pass === validPass) ||
-      (inputEmail === 'admin' && pass === validPass) ||
-      (inputEmail === 'admin@voltriderev.com' && pass === 'admin@123') ||
-      (inputEmail === 'admin@voltriderev.com' && pass === 'admin123')
-    ) {
-      if (typeof window !== 'undefined') {
-        localStorage.setItem('EV_CRM_ADMIN_AUTH', 'true');
+    try {
+      const response = await fetch(`${BACKEND}/api/auth/login`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password: pass })
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        return { success: false, message: result.message || 'Sign in failed.' };
       }
+      setAdminName(result.user?.name || 'Deen Dayak Tiwari');
       setIsAuthenticated(true);
       return { success: true };
+    } catch (error) {
+      return { success: false, message: error instanceof Error ? error.message : 'Unable to reach the authentication server.' };
     }
-    return { success: false, message: 'Invalid Admin credentials. Please check email and password.' };
   };
 
   const logoutAdmin = () => {
-    if (typeof window !== 'undefined') {
-      localStorage.removeItem('EV_CRM_ADMIN_AUTH');
-    }
+    fetch(`${BACKEND}/api/auth/logout`, { method: 'POST', credentials: 'include' })
+      .catch(error => console.error('[Auth] Sign-out request failed:', error));
+    getMongoSocket().disconnect();
     setIsAuthenticated(false);
+    setHasLoadedFromServer(false);
+    setDb(getDefaultDatabase());
   };
 
   const loadDemoData = () => {
@@ -274,29 +275,47 @@ export function CRMProvider({ children }: { children: ReactNode }) {
   const [isMongoConnected, setIsMongoConnected] = useState<boolean>(true);
   const mongoDatabaseName = 'auto-shop (MongoDB Atlas)';
 
-  // Load database on mount from LocalStorage & MongoDB Atlas + connect Real-Time Socket
+  // Restore the server-side session before loading any CRM records.
   useEffect(() => {
-    // 1. Initial fast load from local cache
-    const loaded = loadDatabase();
-    setDb(loaded);
+    let mounted = true;
+    fetch(`${BACKEND}/api/auth/session`, { credentials: 'include' })
+      .then(async response => {
+        if (!response.ok) throw new Error('No active admin session.');
+        return response.json();
+      })
+      .then(result => {
+        if (mounted) {
+          setAdminName(result.user?.name || 'Deen Dayak Tiwari');
+          setIsAuthenticated(true);
+        }
+      })
+      .catch(() => {
+        if (mounted) setDb(getDefaultDatabase());
+      });
+    return () => { mounted = false; };
+  }, []);
 
-    // 2. Fetch live data from MongoDB Atlas
+  // Read data from MongoDB and subscribe to authenticated real-time updates.
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    let mounted = true;
     pullDatabaseFromMongoDB().then(res => {
-      if (res.success && res.data) {
-        const fetchedData = res.data;
-        setDb(prev => {
-          const base = prev || loadDatabase();
-          return {
-            ...base,
-            ...fetchedData,
-            staff: (fetchedData.staff && fetchedData.staff.length > 0) ? fetchedData.staff : base.staff
-          };
-        });
+      if (mounted && res.success && res.data) {
+        skipNextPush.current = true;
+        setDb(prev => ({
+          ...(prev || getDefaultDatabase()),
+          ...res.data,
+          staff: (res.data?.staff && res.data.staff.length > 0)
+            ? res.data.staff
+            : (prev || getDefaultDatabase()).staff
+        }));
+        setHasLoadedFromServer(true);
         setIsMongoConnected(true);
+      } else if (mounted && !res.success) {
+        console.error('[MongoDB] Could not load CRM records:', res.message);
       }
     });
 
-    // 3. Connect Real-Time Socket.io
     try {
       const socket = getMongoSocket();
       if (socket) {
@@ -305,8 +324,8 @@ export function CRMProvider({ children }: { children: ReactNode }) {
         });
 
         socket.on('sync_data', (fullDb: CRMDatabase) => {
+          skipNextPush.current = true;
           setDb(fullDb);
-          saveDatabase(fullDb);
         });
 
         socket.on('db_update', ({ collection, action, data }: any) => {
@@ -360,24 +379,32 @@ export function CRMProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       console.warn('[Socket.io] Real-time listener init warning:', e);
     }
-  }, []);
+    return () => {
+      mounted = false;
+    };
+  }, [isAuthenticated]);
 
-  // Sync back to storage & push to MongoDB Atlas whenever db changes
+  // Persist updates to MongoDB; never cache customer PII in browser localStorage.
   useEffect(() => {
-    if (db) {
-      saveDatabase(db);
+    if (skipNextPush.current) {
+      skipNextPush.current = false;
+      return;
+    }
+    if (db && isAuthenticated && hasLoadedFromServer) {
       const timer = setTimeout(() => {
-        pushDatabaseToMongoDB(db).catch(err => console.warn('[Auto-Sync] push error:', err));
+        pushDatabaseToMongoDB(db).then(result => {
+          if (!result.success) console.error('[Auto-Sync] MongoDB push failed:', result.message);
+        }).catch(err => console.error('[Auto-Sync] MongoDB push error:', err));
       }, 500);
       return () => clearTimeout(timer);
     }
-  }, [db]);
+  }, [db, isAuthenticated, hasLoadedFromServer]);
 
   const currentStaff = useMemo<StaffUser>(() => {
     const fallbackStaff: StaffUser = {
       id: 'staff-01',
-      name: 'Rajiv Singhania',
-      email: 'rajiv.owner@voltriderev.com',
+      name: adminName,
+      email: 'admin@motorshandilya.in',
       role: currentRole,
       phone: '+91 98110 00123',
       isActive: true
@@ -386,8 +413,10 @@ export function CRMProvider({ children }: { children: ReactNode }) {
       return fallbackStaff;
     }
     const found = db.staff.find(s => s.role === currentRole);
-    return found || db.staff[0] || fallbackStaff;
-  }, [db, currentRole]);
+    return currentRole === 'Owner'
+      ? { ...(found || fallbackStaff), name: adminName }
+      : found || db.staff[0] || fallbackStaff;
+  }, [db, currentRole, adminName]);
 
   const addAuditLog = (action: string, module: string, details: string) => {
     if (!db) return;
@@ -462,6 +491,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
     try {
       const res = await fetch(`${BACKEND}/api/inventory-batches`, {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(batchData)
       });
@@ -480,6 +510,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
     try {
       const res = await fetch(`${BACKEND}/api/inventory-batches/${id}`, {
         method: 'PUT',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updates)
       });
@@ -492,7 +523,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
 
   const deleteInventoryBatch = async (id: string): Promise<{ success: boolean; message?: string; archived?: boolean }> => {
     try {
-      const res = await fetch(`${BACKEND}/api/inventory-batches/${id}`, { method: 'DELETE' });
+      const res = await fetch(`${BACKEND}/api/inventory-batches/${id}`, { method: 'DELETE', credentials: 'include' });
       const json = await res.json();
       return { success: json.success, message: json.message, archived: json.archived };
     } catch (err: any) {
@@ -504,6 +535,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
     try {
       const res = await fetch(`${BACKEND}/api/inventory-batches/${batchId}/add-units`, {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ units })
       });
@@ -581,7 +613,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
   };
 
   // 3. Sales & Deliveries (Atomic sale execution)
-  const recordSale = (params: {
+  const recordSale = async (params: {
     customerId: string;
     vehicleId: string;
     saleDate: string;
@@ -607,6 +639,76 @@ export function CRMProvider({ children }: { children: ReactNode }) {
     emiInterestRate?: number;
   }) => {
     if (!db) return { success: false, message: 'Database not initialized' };
+
+    if (params.vehicleId) {
+      try {
+        const paymentMethod = params.financingType === 'FinanceCompany'
+          ? 'Finance Company EMI'
+          : params.financingType === 'ShowroomDirect'
+            ? 'Showroom Installments'
+            : 'Full Payment';
+        const isFullPayment = params.financingType === 'Cash/Self';
+        const response = await fetch(`${BACKEND}/api/customer-sales`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sale: {
+              customerId: params.customerId,
+              vehicleId: params.vehicleId,
+              saleDate: params.saleDate,
+              deliveryDate: params.deliveryDate,
+              exShowroomPrice: params.exShowroomPrice,
+              discount: params.discount,
+              gstAmount: params.gstAmount,
+              accessoriesAmount: params.accessoriesAmount,
+              insuranceAmount: params.insuranceAmount,
+              registrationAmount: params.registrationAmount,
+              totalOnRoadPrice: params.totalOnRoadPrice,
+              bookingAmount: isFullPayment ? params.totalOnRoadPrice : params.bookingAmount,
+              downPayment: isFullPayment ? 0 : params.downPayment,
+              financingType: params.financingType,
+              paymentMethod,
+              financeCompanyName: params.financeCompanyName,
+              loanAccountRef: params.loanAccountRef,
+              installmentCount: params.emiTenureMonths || 12,
+              interestRate: params.emiInterestRate ?? (isFullPayment ? 0 : 10.5),
+              salespersonName: params.salespersonName,
+              registrationNumber: params.registrationNumber,
+              deliveryChecklist: params.deliveryChecklist,
+              handoverNotes: params.handoverNotes,
+              firstDueDate: (() => {
+                const date = new Date(`${params.saleDate}T12:00:00`);
+                date.setMonth(date.getMonth() + 1);
+                return date.toISOString().slice(0, 10);
+              })()
+            }
+          })
+        });
+        const result = await response.json();
+        if (!response.ok || !result.success) {
+          return { success: false, message: result.message || 'Failed to finalize sale.' };
+        }
+        setSelectedSaleForInvoice(result.data.sale as Sale);
+        const refreshed = await pullDatabaseFromMongoDB();
+        if (refreshed.success && refreshed.data) {
+          skipNextPush.current = true;
+          setDb(previous => previous ? {
+            ...previous,
+            ...refreshed.data,
+            staff: refreshed.data?.staff?.length ? refreshed.data.staff : previous.staff
+          } : previous);
+        } else {
+          console.error('[Sales] Sale succeeded, but the latest CRM snapshot could not be loaded:', refreshed.message);
+        }
+        return { success: true, saleId: result.data.sale.id };
+      } catch (error) {
+        return {
+          success: false,
+          message: error instanceof Error ? error.message : 'Unable to reach the sales server.'
+        };
+      }
+    }
 
     const targetVehicle = db.vehicles.find(v => v.id === params.vehicleId);
     if (!targetVehicle) {
@@ -995,58 +1097,40 @@ export function CRMProvider({ children }: { children: ReactNode }) {
   };
 
   // 5. EMI & Collections
-  const recordEMIPayment = (params: {
+  const recordEMIPayment = async (params: {
     emiScheduleId: string;
     installmentNo: number;
     paidAmount: number;
     paymentMethod: 'Cash' | 'UPI' | 'Bank Transfer' | 'Cheque';
     notes?: string;
   }) => {
-    const receiptNumber = `REC-EMI-${Date.now().toString().slice(-4)}`;
-    const paidDate = new Date().toISOString().slice(0, 10);
-
-    setDb(prev => {
-      if (!prev) return prev;
-
-      const updatedSchedules = prev.emiSchedules.map(sch => {
-        if (sch.id !== params.emiScheduleId) return sch;
-
-        const updatedInstallments = sch.installments.map(inst => {
-          if (inst.installmentNo !== params.installmentNo) return inst;
-
-          const totalPaidSoFar = (inst.paidAmount || 0) + params.paidAmount;
-          const isFull = totalPaidSoFar >= inst.amount;
-
-          return {
-            ...inst,
-            paidAmount: totalPaidSoFar,
-            paidDate,
-            status: isFull ? ('Paid' as InstallmentStatus) : ('Partially Paid' as InstallmentStatus),
-            receiptNumber,
-            paymentMethod: params.paymentMethod,
-            notes: params.notes || inst.notes
-          };
-        });
-
-        const newTotalPaid = sch.totalPaidAmount + params.paidAmount;
-        const newOutstanding = Math.max(0, sch.totalFinancedAmount - newTotalPaid);
-
-        return {
-          ...sch,
-          installments: updatedInstallments,
-          totalPaidAmount: newTotalPaid,
-          outstandingBalance: newOutstanding
-        };
+    try {
+      const response = await fetch(`${BACKEND}/api/emi/payment`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          emiScheduleId: params.emiScheduleId,
+          installmentNo: params.installmentNo,
+          paidAmount: params.paidAmount,
+          paymentMethod: params.paymentMethod,
+          notes: params.notes
+        })
       });
-
-      return {
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.message || 'Could not record EMI payment.');
+      setDb(prev => prev ? {
         ...prev,
-        emiSchedules: updatedSchedules
-      };
-    });
-
-    addAuditLog('COLLECT_EMI_PAYMENT', 'EMI & Payments', `Collected ₹${params.paidAmount} for Installment #${params.installmentNo} via ${params.paymentMethod}`);
-    return { success: true, receiptNumber };
+        emiSchedules: prev.emiSchedules.map(schedule =>
+          schedule.id === params.emiScheduleId ? result.data : schedule
+        )
+      } : prev);
+      addAuditLog('COLLECT_EMI_PAYMENT', 'EMI & Payments', `Collected ₹${params.paidAmount} for Installment #${params.installmentNo} via ${params.paymentMethod}`);
+      return { success: true, receiptNumber: result.receiptNumber };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not record EMI payment.';
+      return { success: false, receiptNumber: '', message };
+    }
   };
 
   // 6. Reminders (Strictly WhatsApp Only)
@@ -1262,6 +1346,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
   const syncFromMongoDB = async () => {
     const res = await pullDatabaseFromMongoDB();
     if (res.success && res.data) {
+      skipNextPush.current = true;
       setDb(prev => prev ? { ...prev, ...res.data } : prev);
       addAuditLog('MONGODB_SYNC', 'System', 'Pulled latest live records from MongoDB Atlas (auto-shop)');
       return { success: true, message: res.message };

@@ -491,8 +491,9 @@ export default function SettingsView() {
                   try {
                     const res = await syncToMongoDB();
                     alert(res.message);
-                  } catch (err: any) {
-                    alert(`Sync failed: ${err.message || err.toString()}`);
+                  } catch (err: unknown) {
+                    const message = err instanceof Error ? err.message : String(err);
+                    alert(`Sync failed: ${message}`);
                   } finally {
                     setIsPushing(false);
                   }
@@ -510,8 +511,9 @@ export default function SettingsView() {
                   try {
                     const res = await syncFromMongoDB();
                     alert(res.message);
-                  } catch (err: any) {
-                    alert(`Pull failed: ${err.message || err.toString()}`);
+                  } catch (err: unknown) {
+                    const message = err instanceof Error ? err.message : String(err);
+                    alert(`Pull failed: ${message}`);
                   } finally {
                     setIsPulling(false);
                   }

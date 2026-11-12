@@ -6,7 +6,7 @@ import AdminLoginGate from "@/components/auth/AdminLoginGate";
 import AppShell from "@/components/layout/AppShell";
 
 export const metadata: Metadata = {
-  title: "VoltRider EV Scooty Showroom CRM - Dealership & Service Bay Management",
+  title: "MotorSHANDILYA EV Scooty Showroom CRM",
   description: "Complete EV Scooty Showroom Management System for vehicle inventory, sales, customer KYC, 3 free services, EMI tracking, automated reminders, and financial accounts.",
 };
 

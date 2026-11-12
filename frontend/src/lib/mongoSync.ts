@@ -13,6 +13,7 @@ export function getMongoSocket(): Socket {
   if (!socket && typeof window !== 'undefined') {
     socket = io(BACKEND_URL, {
       transports: ['websocket', 'polling'],
+      withCredentials: true,
       reconnectionAttempts: 10,
       reconnectionDelay: 2000
     });
@@ -24,6 +25,8 @@ export function getMongoSocket(): Socket {
     socket.on('disconnect', () => {
       console.warn('[Real-Time] Disconnected from MongoDB Atlas backend.');
     });
+  } else if (socket && !socket.connected) {
+    socket.connect();
   }
   return socket as Socket;
 }
@@ -33,7 +36,7 @@ export function getMongoSocket(): Socket {
  */
 export async function pullDatabaseFromMongoDB(): Promise<{ success: boolean; data?: Partial<CRMDatabase>; message: string }> {
   try {
-    const res = await fetch(`${BACKEND_URL}/api/all`);
+    const res = await fetch(`${BACKEND_URL}/api/all`, { credentials: 'include' });
     if (!res.ok) {
       throw new Error(`HTTP error! status: ${res.status}`);
     }
@@ -62,6 +65,7 @@ export async function pushDatabaseToMongoDB(localDb: CRMDatabase): Promise<{ suc
   try {
     const res = await fetch(`${BACKEND_URL}/api/sync-push`, {
       method: 'POST',
+      credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(localDb)
     });
@@ -95,7 +99,8 @@ export async function dispatchWhatsAppReminder(
   // 1. Send update to Backend via API (updates MongoDB Atlas in real-time)
   try {
     fetch(`${BACKEND_URL}/api/reminders/${reminder.id}/send-whatsapp`, {
-      method: 'POST'
+      method: 'POST',
+      credentials: 'include'
     }).catch(e => console.warn('[WhatsApp] Backend notification warning:', e.message));
   } catch (e) {
     // ignore
@@ -118,7 +123,7 @@ export async function dispatchWhatsAppReminder(
  */
 export async function resetMongoDBDatabase(): Promise<{ success: boolean; message: string }> {
   try {
-    const res = await fetch(`${BACKEND_URL}/api/seed`, { method: 'POST' });
+    const res = await fetch(`${BACKEND_URL}/api/seed`, { method: 'POST', credentials: 'include' });
     const json = await res.json();
     return {
       success: json.success,
@@ -137,7 +142,7 @@ export async function resetMongoDBDatabase(): Promise<{ success: boolean; messag
  */
 export async function wipeCleanMongoDB(): Promise<{ success: boolean; message: string }> {
   try {
-    const res = await fetch(`${BACKEND_URL}/api/wipe-clean`, { method: 'POST' });
+    const res = await fetch(`${BACKEND_URL}/api/wipe-clean`, { method: 'POST', credentials: 'include' });
     const json = await res.json();
     return {
       success: json.success,
@@ -150,4 +155,3 @@ export async function wipeCleanMongoDB(): Promise<{ success: boolean; message: s
     };
   }
 }
-

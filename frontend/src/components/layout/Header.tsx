@@ -2,7 +2,6 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 import { useCRM } from '@/context/CRMContext';
-import { StaffRole } from '@/types/crm';
 import {
   Search,
   Bell,
@@ -11,14 +10,11 @@ import {
   X,
   ArrowRight,
   Database,
-  LogOut,
   Wifi
 } from 'lucide-react';
 
 export default function Header() {
   const {
-    currentRole,
-    setCurrentRole,
     currentStaff,
     globalSearch,
     setGlobalSearch,
@@ -31,7 +27,6 @@ export default function Header() {
     setIsQuickActionOpen,
     syncToFirestore,
     isMongoConnected,
-    logoutAdmin
   } = useCRM();
 
   const [isSyncing, setIsSyncing] = useState(false);
@@ -49,9 +44,7 @@ export default function Header() {
   };
 
   const [isNotifOpen, setIsNotifOpen] = useState(false);
-  const [isRoleOpen, setIsRoleOpen] = useState(false);
   const notifRef = useRef<HTMLDivElement>(null);
-  const roleRef = useRef<HTMLDivElement>(null);
 
   // Close dropdowns on outside click
   useEffect(() => {
@@ -59,15 +52,10 @@ export default function Header() {
       if (notifRef.current && !notifRef.current.contains(event.target as Node)) {
         setIsNotifOpen(false);
       }
-      if (roleRef.current && !roleRef.current.contains(event.target as Node)) {
-        setIsRoleOpen(false);
-      }
     }
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
-
-  const roles: StaffRole[] = ['Owner', 'Manager', 'Sales Staff', 'Accountant', 'Service Technician'];
 
   // Global search filtering
   const query = globalSearch.trim().toLowerCase();
@@ -273,53 +261,14 @@ export default function Header() {
           )}
         </div>
 
-        {/* Role Switcher (Simulates Owner, Manager, Sales, Accountant, Technician permissions) */}
-        <div className="relative" ref={roleRef}>
-          <button
-            onClick={() => setIsRoleOpen(!isRoleOpen)}
-            className="flex items-center gap-2 pl-3 pr-3 py-1.5 rounded-xl border border-slate-200 bg-slate-50 hover:bg-slate-100 transition text-left"
-          >
-            <div className="h-7 w-7 rounded-lg bg-amber-100 flex items-center justify-center text-amber-800">
-              <Shield className="h-4 w-4" />
-            </div>
-            <div>
-              <p className="text-xs font-bold text-slate-900 leading-none">{currentStaff.name}</p>
-              <p className="text-[10px] font-semibold text-amber-600 mt-0.5">{currentRole}</p>
-            </div>
-          </button>
-
-          {isRoleOpen && (
-            <div className="absolute right-0 top-full mt-2 w-52 bg-white rounded-2xl shadow-xl border border-slate-200 p-2 z-50 text-xs">
-              <p className="px-3 py-1.5 text-[10px] font-bold uppercase text-slate-400">Switch Role View</p>
-              {roles.map(role => (
-                <button
-                  key={role}
-                  onClick={() => {
-                    setCurrentRole(role);
-                    setIsRoleOpen(false);
-                  }}
-                  className={`w-full text-left px-3 py-2 rounded-lg font-medium transition flex items-center justify-between ${
-                    currentRole === role ? 'bg-amber-50 text-amber-900 font-bold' : 'hover:bg-slate-50 text-slate-700'
-                  }`}
-                >
-                  <span>{role}</span>
-                  {currentRole === role && <span className="h-1.5 w-1.5 rounded-full bg-amber-500"></span>}
-                </button>
-              ))}
-
-              <div className="my-1.5 border-t border-slate-100" />
-              <button
-                onClick={() => {
-                  setIsRoleOpen(false);
-                  logoutAdmin();
-                }}
-                className="w-full text-left px-3 py-2 rounded-lg font-semibold text-rose-600 hover:bg-rose-50 transition flex items-center gap-2"
-              >
-                <LogOut className="w-3.5 h-3.5" />
-                <span>Sign Out Admin</span>
-              </button>
-            </div>
-          )}
+        <div className="hidden sm:flex items-center gap-2 pl-3 pr-3 py-1.5 rounded-xl border border-slate-200 bg-slate-50">
+          <div className="h-7 w-7 rounded-lg bg-amber-100 flex items-center justify-center text-amber-800">
+            <Shield className="h-4 w-4" />
+          </div>
+          <div>
+            <p className="text-xs font-bold text-slate-900 leading-none">{currentStaff.name}</p>
+            <p className="text-[10px] font-semibold text-amber-600 mt-0.5">Administrator</p>
+          </div>
         </div>
       </div>
     </header>

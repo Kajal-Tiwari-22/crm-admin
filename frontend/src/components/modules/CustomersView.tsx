@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 import { useCRM } from '@/context/CRMContext';
 import { Customer } from '@/types/crm';
 import { formatCurrency, formatDate, exportToCSV } from '@/lib/storage';
+import CustomerSaleForm from '@/components/modules/CustomerSaleForm';
 import {
   Users,
   Plus,
@@ -11,29 +12,32 @@ import {
   Download,
   Phone,
   Mail,
-  MapPin,
   Bike,
   Wrench,
   CreditCard,
   FileCheck,
-  ExternalLink,
-  Upload,
   Trash2,
   FileText,
   Paperclip,
-  X
+  X,
+  Archive,
+  Edit2,
+  ShieldCheck
 } from 'lucide-react';
+
+const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000';
 
 export default function CustomersView() {
   const {
     customers,
-    addCustomer,
     addCustomerDocument,
     removeCustomerDocument,
     vehicles,
     sales,
     services,
     emiSchedules,
+    warrantyInsurance,
+    syncFromMongoDB,
     setSelectedSaleForInvoice,
     setSelectedServiceForJobCard
   } = useCRM();
@@ -41,6 +45,14 @@ export default function CustomersView() {
   const [searchTerm, setSearchTerm] = useState('');
   const [isAddCustomerOpen, setIsAddCustomerOpen] = useState(false);
   const [selectedCustomerId, setSelectedCustomerId] = useState<string | null>(null);
+  const [purchaseMethodFilter, setPurchaseMethodFilter] = useState('All');
+  const [paymentStatusFilter, setPaymentStatusFilter] = useState('All');
+  const [purchaseFrom, setPurchaseFrom] = useState('');
+  const [purchaseTo, setPurchaseTo] = useState('');
+  const [editingCustomer, setEditingCustomer] = useState<Customer | null>(null);
+  const [editForm, setEditForm] = useState({ name: '', phone: '', email: '', currentAddress: '', permanentAddress: '', panNumber: '' });
+  const [actionError, setActionError] = useState('');
+  const [saleSuccess, setSaleSuccess] = useState('');
 
   // Document upload state
   const [docType, setDocType] = useState<'Aadhaar' | 'PAN' | 'DrivingLicense' | 'ElectricityBill' | 'Photo' | 'Other'>('Aadhaar');
@@ -50,49 +62,69 @@ export default function CustomersView() {
 
   const selectedCustomer = customers.find(c => c.id === selectedCustomerId) || null;
 
-  const [newCustomerForm, setNewCustomerForm] = useState({
-    name: '',
-    phone: '',
-    email: '',
-    address: '',
-    city: 'New Delhi',
-    pincode: '110025',
-    aadhaarNumber: '',
-    panNumber: '',
-    notes: '',
-    communicationPreference: 'WhatsApp' as Customer['communicationPreference']
+  const activeCustomers = customers.filter(customer => !customer.archivedAt);
+  const filteredCustomers = activeCustomers.filter(customer => {
+    const customerSales = sales.filter(sale => sale.customerId === customer.id);
+    const matchingSale = customerSales.find(sale => {
+      const vehicle = vehicles.find(item => item.id === sale.vehicleId);
+      const haystack = `${vehicle?.modelNumber || vehicle?.model || ''} ${sale.invoiceNumber}`.toLowerCase();
+      return haystack.includes(searchTerm.toLowerCase());
+    });
+    const matchesSearch = !searchTerm ||
+      customer.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      customer.phone.includes(searchTerm) ||
+      customer.customerCode.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      Boolean(matchingSale);
+    const latestSale = customerSales.sort((a, b) => b.saleDate.localeCompare(a.saleDate))[0];
+    const schedule = emiSchedules.find(item => item.customerId === customer.id);
+    const outstanding = schedule?.outstandingBalance ?? latestSale?.remainingAmount ?? 0;
+    const overdue = schedule?.installments.some(item =>
+      item.status === 'Overdue' || (item.status !== 'Paid' && item.dueDate < new Date().toISOString().slice(0, 10))
+    ) || false;
+    const status = !latestSale ? 'No purchase' : outstanding <= 0 ? 'Paid' : overdue ? 'Overdue' : 'Upcoming';
+    const matchesMethod = purchaseMethodFilter === 'All' || latestSale?.paymentMethod === purchaseMethodFilter;
+    const matchesStatus = paymentStatusFilter === 'All' ||
+      (paymentStatusFilter === 'Outstanding' ? outstanding > 0 : status === paymentStatusFilter);
+    const matchesDate = (!purchaseFrom || Boolean(latestSale && latestSale.saleDate >= purchaseFrom)) &&
+      (!purchaseTo || Boolean(latestSale && latestSale.saleDate <= purchaseTo));
+    return matchesSearch && matchesMethod && matchesStatus && matchesDate;
   });
 
-  const filteredCustomers = customers.filter(c =>
-    c.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    c.phone.includes(searchTerm) ||
-    c.customerCode.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    c.city.toLowerCase().includes(searchTerm.toLowerCase())
-  );
+  const saveCustomerEdit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!editingCustomer) return;
+    setActionError('');
+    try {
+      const response = await fetch(`${BACKEND}/api/customers/${editingCustomer.id}`, {
+        method: 'PUT',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...editForm,
+          address: editForm.currentAddress,
+          panNumber: editForm.panNumber.toUpperCase()
+        })
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.message || 'Customer update failed.');
+      await syncFromMongoDB();
+      setEditingCustomer(null);
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'Customer update failed.');
+    }
+  };
 
-  const handleAddCustomer = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newCustomerForm.name || !newCustomerForm.phone) return;
-
-    addCustomer({
-      ...newCustomerForm,
-      documents: [],
-      vehicleIds: []
-    });
-
-    setIsAddCustomerOpen(false);
-    setNewCustomerForm({
-      name: '',
-      phone: '',
-      email: '',
-      address: '',
-      city: 'New Delhi',
-      pincode: '110025',
-      aadhaarNumber: '',
-      panNumber: '',
-      notes: '',
-      communicationPreference: 'WhatsApp'
-    });
+  const archiveCustomer = async (customer: Customer) => {
+    if (!window.confirm(`Archive ${customer.name}? Financial and service history will be preserved.`)) return;
+    setActionError('');
+    try {
+      const response = await fetch(`${BACKEND}/api/customers/${customer.id}`, { method: 'DELETE', credentials: 'include' });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.message || 'Could not archive customer.');
+      await syncFromMongoDB();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'Could not archive customer.');
+    }
   };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -126,6 +158,12 @@ export default function CustomersView() {
 
   return (
     <div className="space-y-6">
+      {saleSuccess && (
+        <div role="status" className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800">
+          <span>Customer and scooter sale saved successfully. Invoice {saleSuccess}.</span>
+          <button onClick={() => setSaleSuccess('')} className="font-bold text-emerald-900">Dismiss</button>
+        </div>
+      )}
       {/* Header */}
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
         <div>
@@ -139,7 +177,14 @@ export default function CustomersView() {
         </div>
         <div className="flex items-center gap-2">
           <button
-            onClick={() => exportToCSV(customers, 'Showroom_Customers_Directory')}
+            onClick={() => exportToCSV(activeCustomers.map(customer => ({
+              customerCode: customer.customerCode,
+              name: customer.name,
+              phone: customer.phone,
+              email: customer.email,
+              city: customer.city,
+              currentAddress: customer.currentAddress || customer.address
+            })), 'Showroom_Customers_Directory')}
             className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold shadow-2xs transition"
           >
             <Download className="h-4 w-4" />
@@ -161,11 +206,29 @@ export default function CustomersView() {
           <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
           <input
             type="text"
-            placeholder="Search by customer name, phone number, customer code, city..."
+            placeholder="Search customer, phone, scooter model, or invoice number..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
             className="w-full pl-9 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-800 placeholder-slate-400 focus:outline-hidden focus:border-blue-500 transition"
           />
+        </div>
+        <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
+          <label className="text-[11px] font-semibold text-slate-500">Payment method
+            <select value={purchaseMethodFilter} onChange={event => setPurchaseMethodFilter(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 p-2 text-xs text-slate-700">
+              <option value="All">All methods</option><option value="Full Payment">Full Payment</option><option value="Finance Company EMI">Finance Company EMI</option><option value="Showroom Installments">Showroom Installments</option>
+            </select>
+          </label>
+          <label className="text-[11px] font-semibold text-slate-500">Payment status
+            <select value={paymentStatusFilter} onChange={event => setPaymentStatusFilter(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 p-2 text-xs text-slate-700">
+              <option value="All">All statuses</option><option value="Paid">Paid</option><option value="Upcoming">Upcoming</option><option value="Overdue">Overdue</option><option value="Outstanding">Outstanding balance</option>
+            </select>
+          </label>
+          <label className="text-[11px] font-semibold text-slate-500">Purchase date from
+            <input type="date" value={purchaseFrom} onChange={event => setPurchaseFrom(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 p-2 text-xs text-slate-700" />
+          </label>
+          <label className="text-[11px] font-semibold text-slate-500">Purchase date to
+            <input type="date" value={purchaseTo} onChange={event => setPurchaseTo(event.target.value)} className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 p-2 text-xs text-slate-700" />
+          </label>
         </div>
       </div>
 
@@ -176,17 +239,28 @@ export default function CustomersView() {
             <thead>
               <tr className="bg-slate-50 text-slate-600 font-bold border-b border-slate-200 uppercase tracking-wider text-[10px]">
                 <th className="p-3.5">Customer</th>
-                <th className="p-3.5">Contact Details</th>
-                <th className="p-3.5">City & Address</th>
-                <th className="p-3.5">EVs Owned</th>
-                <th className="p-3.5">Documents Status</th>
-                <th className="p-3.5 text-center">Profile</th>
+                <th className="p-3.5">Phone</th>
+                <th className="p-3.5">Scooter / Sale Date</th>
+                <th className="p-3.5 text-right">Final Price</th>
+                <th className="p-3.5">Payment / Balance</th>
+                <th className="p-3.5">Next Due / Status</th>
+                <th className="p-3.5 text-center">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {filteredCustomers.length > 0 ? (
                 filteredCustomers.map((c) => {
                   const ownedVehicles = vehicles.filter(v => c.vehicleIds.includes(v.id));
+                  const customerSale = sales
+                    .filter(sale => sale.customerId === c.id)
+                    .sort((a, b) => b.saleDate.localeCompare(a.saleDate))[0];
+                  const saleVehicle = customerSale && vehicles.find(vehicle => vehicle.id === customerSale.vehicleId);
+                  const schedule = emiSchedules.find(item => item.customerId === c.id);
+                  const openInstallments = schedule?.installments.filter(item => item.status !== 'Paid') || [];
+                  const nextInstallment = openInstallments.sort((a, b) => a.dueDate.localeCompare(b.dueDate))[0];
+                  const outstanding = schedule?.outstandingBalance ?? customerSale?.remainingAmount ?? 0;
+                  const paymentStatus = !customerSale ? 'No purchase' : outstanding <= 0 ? 'Paid' :
+                    nextInstallment?.status === 'Overdue' || (nextInstallment && nextInstallment.dueDate < new Date().toISOString().slice(0, 10)) ? 'Overdue' : 'Upcoming';
 
                   return (
                     <tr key={c.id} className="hover:bg-slate-50/70 transition">
@@ -194,54 +268,40 @@ export default function CustomersView() {
                         <div className="font-bold text-slate-900">{c.name}</div>
                         <div className="text-[10px] font-mono text-slate-400">{c.customerCode}</div>
                       </td>
-                      <td className="p-3.5 space-y-0.5">
-                        <div className="flex items-center gap-1.5 text-slate-700 font-medium">
-                          <Phone className="h-3 w-3 text-emerald-600" />
-                          <span>{c.phone}</span>
+                      <td className="p-3.5">
+                        <span className="flex items-center gap-1.5 text-slate-700 font-medium"><Phone className="h-3 w-3 text-emerald-600" />{c.phone}</span>
+                        {c.email && <span className="mt-1 flex items-center gap-1.5 text-[11px] text-slate-500"><Mail className="h-3 w-3 text-slate-400" />{c.email}</span>}
+                      </td>
+                      <td className="p-3.5">
+                        <div className="font-semibold text-slate-800">{saleVehicle ? `${saleVehicle.brand} ${saleVehicle.model}` : (ownedVehicles[0]?.model || '—')}</div>
+                        <div className="mt-1 text-[10px] text-slate-500">{customerSale ? formatDate(customerSale.saleDate) : 'No sale recorded'}</div>
+                        {customerSale && <div className="font-mono text-[10px] text-slate-400">{customerSale.invoiceNumber}</div>}
+                      </td>
+                      <td className="p-3.5 text-right font-mono font-bold text-slate-800">{customerSale ? formatCurrency(customerSale.finalSellingPrice ?? customerSale.totalOnRoadPrice) : '—'}</td>
+                      <td className="p-3.5">
+                        <div className="font-semibold text-slate-700">{customerSale?.paymentMethod || customerSale?.financingType || '—'}</div>
+                        <div className="mt-1 text-[11px] text-rose-700">Balance: {formatCurrency(outstanding)}</div>
+                      </td>
+                      <td className="p-3.5">
+                        <div>{nextInstallment ? formatDate(nextInstallment.dueDate) : '—'}</div>
+                        <span className={`mt-1 inline-block rounded-full px-2 py-0.5 text-[10px] font-bold ${paymentStatus === 'Overdue' ? 'bg-rose-100 text-rose-700' : paymentStatus === 'Paid' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-800'}`}>{paymentStatus}</span>
+                      </td>
+                      <td className="p-3.5">
+                        <div className="flex flex-wrap justify-center gap-1">
+                          <button onClick={() => setSelectedCustomerId(c.id)} className="rounded-lg border border-slate-200 px-2 py-1 text-[11px] font-bold text-blue-700 hover:bg-blue-50">View</button>
+                          <button onClick={() => {
+                            setEditingCustomer(c);
+                            setEditForm({ name: c.name, phone: c.phone, email: c.email, currentAddress: c.currentAddress || c.address, permanentAddress: c.permanentAddress || '', panNumber: c.panNumber || '' });
+                          }} className="rounded-lg border border-slate-200 px-2 py-1 text-[11px] font-bold text-slate-700 hover:bg-slate-50"><Edit2 className="inline h-3 w-3" /> Edit</button>
+                          <button onClick={() => archiveCustomer(c)} className="rounded-lg border border-amber-200 px-2 py-1 text-[11px] font-bold text-amber-800 hover:bg-amber-50"><Archive className="inline h-3 w-3" /> Archive</button>
                         </div>
-                        <div className="flex items-center gap-1.5 text-slate-500 text-[11px]">
-                          <Mail className="h-3 w-3 text-slate-400" />
-                          <span>{c.email}</span>
-                        </div>
-                      </td>
-                      <td className="p-3.5">
-                        <p className="font-semibold text-slate-800">{c.city}</p>
-                        <p className="text-[11px] text-slate-500 line-clamp-1">{c.address}</p>
-                      </td>
-                      <td className="p-3.5">
-                        {ownedVehicles.length > 0 ? (
-                          <div className="space-y-1">
-                            {ownedVehicles.map(ov => (
-                              <div key={ov.id} className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-50 text-amber-900 border border-amber-200 text-[11px] font-medium mr-1">
-                                <Bike className="h-3 w-3 text-amber-600" />
-                                <span>{ov.brand} {ov.model}</span>
-                              </div>
-                            ))}
-                          </div>
-                        ) : (
-                          <span className="text-slate-400 italic">No vehicle purchased yet</span>
-                        )}
-                      </td>
-                      <td className="p-3.5">
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800">
-                          <FileCheck className="h-3 w-3" />
-                          {c.documents.filter(d => d.status === 'Verified').length} / {c.documents.length} Verified
-                        </span>
-                      </td>
-                      <td className="p-3.5 text-center">
-                        <button
-                          onClick={() => setSelectedCustomerId(c.id)}
-                          className="px-3 py-1.5 rounded-lg border border-slate-200 text-blue-700 hover:bg-blue-50 font-bold transition text-xs"
-                        >
-                          View Profile & Docs
-                        </button>
                       </td>
                     </tr>
                   );
                 })
               ) : (
                 <tr>
-                  <td colSpan={6} className="p-8 text-center text-slate-400">
+                  <td colSpan={7} className="p-8 text-center text-slate-400">
                     No customers found matching search term.
                   </td>
                 </tr>
@@ -281,13 +341,52 @@ export default function CustomersView() {
                 </div>
                 <div>
                   <span className="text-slate-400 text-[10px] uppercase font-bold">Identity Docs</span>
-                  <p className="text-slate-700 mt-0.5">PAN: <strong className="font-mono">{selectedCustomer.panNumber || 'Not provided'}</strong></p>
-                  <p className="text-slate-700">Aadhaar: <strong className="font-mono">{selectedCustomer.aadhaarNumber || 'Not provided'}</strong></p>
+                  <p className="text-slate-700 mt-0.5">PAN: <strong className="font-mono">{selectedCustomer.panNumber ? `••••••${selectedCustomer.panNumber.slice(-4)}` : 'Not provided'}</strong></p>
+                  <p className="text-slate-700">Aadhaar: <strong className="font-mono">{selectedCustomer.aadhaarNumber ? `••••••••${selectedCustomer.aadhaarNumber.slice(-4)}` : 'Not provided'}</strong></p>
                 </div>
                 <div>
                   <span className="text-slate-400 text-[10px] uppercase font-bold">Address</span>
-                  <p className="text-slate-700 mt-0.5 leading-snug">{selectedCustomer.address || 'Showroom record'}</p>
+                  <p className="text-slate-700 mt-0.5 leading-snug">Current: {selectedCustomer.currentAddress || selectedCustomer.address || 'Not provided'}</p>
+                  <p className="mt-1 leading-snug text-slate-700">Permanent: {selectedCustomer.permanentAddress || 'Not provided'}</p>
                 </div>
+              </div>
+
+              {selectedCustomer.guarantorRequired && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50/60 p-3.5">
+                  <h3 className="mb-2 font-bold text-amber-950">Guarantor Details</h3>
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                    <p><span className="text-slate-500">Name</span><strong className="block">{selectedCustomer.guarantor?.name || '—'}</strong></p>
+                    <p><span className="text-slate-500">Phone</span><strong className="block">{selectedCustomer.guarantor?.phone || '—'}</strong></p>
+                    <p><span className="text-slate-500">Address</span><strong className="block">{selectedCustomer.guarantor?.address || '—'}</strong></p>
+                  </div>
+                </div>
+              )}
+
+              <div className="space-y-2">
+                <h3 className="font-bold text-slate-900 text-sm">Sale Invoices & Payment History</h3>
+                {sales.filter(sale => sale.customerId === selectedCustomer.id).map(sale => (
+                  <div key={sale.id} className="rounded-xl border border-emerald-200 bg-emerald-50/30 p-3">
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                      <div>
+                        <p className="font-mono font-bold text-slate-900">{sale.invoiceNumber}</p>
+                        <p className="mt-1 text-[11px] text-slate-600">{sale.modelNumber || vehicles.find(vehicle => vehicle.id === sale.vehicleId)?.model} · {formatDate(sale.saleDate)} · {sale.paymentMethod || sale.financingType}</p>
+                      </div>
+                      <button onClick={() => setSelectedSaleForInvoice(sale)} className="rounded-lg border border-emerald-200 bg-white px-2.5 py-1.5 text-[11px] font-bold text-emerald-800">View invoice</button>
+                    </div>
+                    <div className="mt-2 grid grid-cols-2 gap-2 text-[11px] sm:grid-cols-4">
+                      <p>Final price<strong className="block text-slate-900">{formatCurrency(sale.finalSellingPrice ?? sale.totalOnRoadPrice)}</strong></p>
+                      <p>Outstanding<strong className="block text-rose-700">{formatCurrency(sale.remainingAmount || 0)}</strong></p>
+                      <p>Chassis<strong className="block break-all font-mono">{sale.chassisVin || vehicles.find(vehicle => vehicle.id === sale.vehicleId)?.chassisVin || '—'}</strong></p>
+                      <p>Battery<strong className="block break-all font-mono">{sale.batterySerial || vehicles.find(vehicle => vehicle.id === sale.vehicleId)?.batterySerial || '—'}</strong></p>
+                    </div>
+                    {sale.paymentLedger?.map((payment, index) => (
+                      <p key={index} className="mt-2 border-t border-emerald-100 pt-2 text-[11px] text-slate-600">
+                        Payment received {formatCurrency(payment.amountPaid)} on {formatDate(payment.paymentDate)} via {payment.paymentMethod}; balance {formatCurrency(payment.outstandingBalance)}
+                      </p>
+                    ))}
+                  </div>
+                ))}
+                {sales.every(sale => sale.customerId !== selectedCustomer.id) && <p className="text-xs text-slate-500">No sale has been recorded for this customer.</p>}
               </div>
 
               {/* KYC & Document Upload Section */}
@@ -501,8 +600,34 @@ export default function CustomersView() {
                           <p className="font-mono font-bold text-rose-700">{formatCurrency(emi.outstandingBalance)}</p>
                         </div>
                       </div>
+                      <div className="mt-3 divide-y divide-purple-100 border-t border-purple-100">
+                        {emi.installments.map(inst => (
+                          <div key={inst.installmentNo} className="flex flex-wrap items-center justify-between gap-2 py-2 text-[11px]">
+                            <span>#{inst.installmentNo} · Due {formatDate(inst.dueDate)} · {inst.status}</span>
+                            <span className="font-mono">{formatCurrency(inst.paidAmount || 0)} / {formatCurrency(inst.amount)}</span>
+                            <span className="text-slate-500">{inst.payments?.map(payment => `${formatDate(payment.paymentDate)} · ${payment.paymentMethod} · ${payment.receiptNumber}`).join(', ') || inst.receiptNumber || 'No payments'}</span>
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   ))}
+                </div>
+              </div>
+
+              <div>
+                <h3 className="font-bold text-slate-900 text-sm mb-2 flex items-center gap-1.5">
+                  <ShieldCheck className="h-4 w-4 text-emerald-700" /> Warranty Information
+                </h3>
+                <div className="space-y-2">
+                  {warrantyInsurance.filter(item => item.customerId === selectedCustomer.id).map(item => (
+                    <div key={item.id} className="grid grid-cols-1 gap-2 rounded-xl border border-emerald-200 bg-emerald-50/30 p-3 sm:grid-cols-4">
+                      <p className="font-semibold">{item.policyType}<span className="block text-[10px] font-normal text-slate-500">{item.vehicleModel || item.chassisVin}</span></p>
+                      <p>Provider<strong className="block">{item.providerName || '—'}</strong></p>
+                      <p>Coverage<strong className="block">{formatDate(item.startDate)} – {formatDate(item.endDate)}</strong></p>
+                      <p>Status<strong className="block">{item.status}</strong></p>
+                    </div>
+                  ))}
+                  {!warrantyInsurance.some(item => item.customerId === selectedCustomer.id) && <p className="text-xs text-slate-500">No warranty record found.</p>}
                 </div>
               </div>
 
@@ -516,119 +641,40 @@ export default function CustomersView() {
         </div>
       )}
 
-      {/* Add Customer Modal */}
+      {actionError && <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">{actionError}</p>}
+
       {isAddCustomerOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4 backdrop-blur-xs">
-          <div className="relative w-full max-w-lg rounded-2xl bg-white shadow-2xl p-6">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-100">
-              <h2 className="text-base font-bold text-slate-900">Add New Customer Profile</h2>
-              <button
-                onClick={() => setIsAddCustomerOpen(false)}
-                className="rounded-lg p-1 text-slate-400 hover:bg-slate-100"
-              >
-                <X className="h-5 w-5" />
-              </button>
+        <CustomerSaleForm
+          onClose={() => setIsAddCustomerOpen(false)}
+          onSaved={invoiceNumber => {
+            void syncFromMongoDB();
+            setSaleSuccess(invoiceNumber);
+            setIsAddCustomerOpen(false);
+          }}
+        />
+      )}
+
+      {editingCustomer && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center overflow-y-auto bg-slate-950/60 p-4 backdrop-blur-sm">
+          <form onSubmit={saveCustomerEdit} className="my-4 w-full max-w-2xl space-y-4 rounded-2xl bg-white p-5 shadow-2xl sm:p-6">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div><h2 className="font-bold text-slate-900">Edit Customer</h2><p className="text-xs text-slate-500">{editingCustomer.customerCode}</p></div>
+              <button type="button" aria-label="Close" onClick={() => setEditingCustomer(null)} className="rounded-lg p-2 text-slate-500 hover:bg-slate-100"><X className="h-4 w-4" /></button>
             </div>
-
-            <form onSubmit={handleAddCustomer} className="mt-4 space-y-3 text-xs">
-              <div>
-                <label className="font-semibold text-slate-700 block mb-1">Full Name *</label>
-                <input
-                  type="text"
-                  required
-                  value={newCustomerForm.name}
-                  onChange={(e) => setNewCustomerForm({ ...newCustomerForm, name: e.target.value })}
-                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl"
-                  placeholder="e.g. Rahul Sharma"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="font-semibold text-slate-700 block mb-1">Phone Number *</label>
-                  <input
-                    type="text"
-                    required
-                    value={newCustomerForm.phone}
-                    onChange={(e) => setNewCustomerForm({ ...newCustomerForm, phone: e.target.value })}
-                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl"
-                    placeholder="+91 98XXX XXXXX"
-                  />
-                </div>
-                <div>
-                  <label className="font-semibold text-slate-700 block mb-1">Email Address</label>
-                  <input
-                    type="email"
-                    value={newCustomerForm.email}
-                    onChange={(e) => setNewCustomerForm({ ...newCustomerForm, email: e.target.value })}
-                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl"
-                    placeholder="name@email.com"
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="font-semibold text-slate-700 block mb-1">Aadhaar (Last 4 / Full)</label>
-                  <input
-                    type="text"
-                    value={newCustomerForm.aadhaarNumber}
-                    onChange={(e) => setNewCustomerForm({ ...newCustomerForm, aadhaarNumber: e.target.value })}
-                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl"
-                    placeholder="XXXX-XXXX-9901"
-                  />
-                </div>
-                <div>
-                  <label className="font-semibold text-slate-700 block mb-1">PAN Card Number</label>
-                  <input
-                    type="text"
-                    value={newCustomerForm.panNumber}
-                    onChange={(e) => setNewCustomerForm({ ...newCustomerForm, panNumber: e.target.value.toUpperCase() })}
-                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl font-mono uppercase"
-                    placeholder="ABCDE1234F"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="font-semibold text-slate-700 block mb-1">Address & City</label>
-                <input
-                  type="text"
-                  value={newCustomerForm.address}
-                  onChange={(e) => setNewCustomerForm({ ...newCustomerForm, address: e.target.value })}
-                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl"
-                  placeholder="Street / Flat / Area"
-                />
-              </div>
-
-              <div>
-                <label className="font-semibold text-slate-700 block mb-1">Customer Preferences / Notes</label>
-                <textarea
-                  rows={2}
-                  value={newCustomerForm.notes}
-                  onChange={(e) => setNewCustomerForm({ ...newCustomerForm, notes: e.target.value })}
-                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl"
-                  placeholder="e.g. Prefers fast charger installation at residence."
-                />
-              </div>
-
-              <div className="pt-3 border-t border-slate-100 flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setIsAddCustomerOpen(false)}
-                  className="px-4 py-2 rounded-xl border border-slate-200 text-slate-600"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold"
-                >
-                  Create Customer Record
-                </button>
-              </div>
-            </form>
-          </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <label className="text-xs font-semibold text-slate-700">Name<input required className="mt-1 w-full rounded-xl border border-slate-200 p-2.5" value={editForm.name} onChange={event => setEditForm({ ...editForm, name: event.target.value })} /></label>
+              <label className="text-xs font-semibold text-slate-700">Phone<input required inputMode="tel" className="mt-1 w-full rounded-xl border border-slate-200 p-2.5" value={editForm.phone} onChange={event => setEditForm({ ...editForm, phone: event.target.value })} /></label>
+              <label className="text-xs font-semibold text-slate-700">Email<input type="email" className="mt-1 w-full rounded-xl border border-slate-200 p-2.5" value={editForm.email} onChange={event => setEditForm({ ...editForm, email: event.target.value })} /></label>
+              <label className="text-xs font-semibold text-slate-700">PAN<input maxLength={10} pattern="[A-Za-z]{5}[0-9]{4}[A-Za-z]" className="mt-1 w-full rounded-xl border border-slate-200 p-2.5 uppercase" value={editForm.panNumber} onChange={event => setEditForm({ ...editForm, panNumber: event.target.value.toUpperCase() })} /></label>
+              <label className="text-xs font-semibold text-slate-700">Current Address<textarea rows={2} className="mt-1 w-full rounded-xl border border-slate-200 p-2.5" value={editForm.currentAddress} onChange={event => setEditForm({ ...editForm, currentAddress: event.target.value })} /></label>
+              <label className="text-xs font-semibold text-slate-700">Permanent Address<textarea rows={2} className="mt-1 w-full rounded-xl border border-slate-200 p-2.5" value={editForm.permanentAddress} onChange={event => setEditForm({ ...editForm, permanentAddress: event.target.value })} /></label>
+            </div>
+            {actionError && <p role="alert" className="text-xs text-rose-600">{actionError}</p>}
+            <div className="flex justify-end gap-2 border-t border-slate-100 pt-3">
+              <button type="button" onClick={() => setEditingCustomer(null)} className="rounded-xl border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-600">Cancel</button>
+              <button type="submit" className="rounded-xl bg-blue-600 px-4 py-2 text-xs font-bold text-white">Save Changes</button>
+            </div>
+          </form>
         </div>
       )}
     </div>

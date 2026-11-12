@@ -46,6 +46,30 @@
   }
 }
 
+button,
+a[href],
+select,
+input[type="button"],
+input[type="submit"],
+input[type="reset"],
+input[type="checkbox"],
+input[type="radio"],
+input[type="date"],
+summary,
+[role="button"],
+label[for] {
+  cursor: pointer;
+}
+
+button:disabled,
+button[aria-disabled="true"],
+a[aria-disabled="true"],
+select:disabled,
+input:disabled,
+[role="button"][aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
 /* Custom Scrollbar */
 ::-webkit-scrollbar {
   width: 6px;

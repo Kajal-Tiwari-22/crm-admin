@@ -55,6 +55,7 @@ export function getDefaultDatabase(): CRMDatabase {
 export function getSampleDemoDatabase(): CRMDatabase {
   return {
     vehicles: initialVehicles,
+    inventoryBatches: [],
     customers: initialCustomers,
     sales: initialSales,
     services: initialServices,

@@ -259,7 +259,7 @@ export default function InventoryView() {
   const fetchBatchUnits = async (batchId: string) => {
     setLoadingUnits(true);
     try {
-      const res = await fetch(`${BACKEND}/api/inventory-batches/${batchId}`);
+      const res = await fetch(`${BACKEND}/api/inventory-batches/${batchId}`, { credentials: 'include' });
       const json = await res.json();
       if (json.success) {
         setBatchUnits(json.data.units || []);

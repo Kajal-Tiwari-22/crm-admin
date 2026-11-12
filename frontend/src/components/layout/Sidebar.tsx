@@ -76,9 +76,9 @@ export default function Sidebar() {
           </div>
           <div>
             <h1 className="text-base font-black text-slate-900 tracking-tight leading-none">
-              VoltRider <span className="text-amber-500">CRM</span>
+              MotorSHANDILYA <span className="text-amber-500">CRM</span>
             </h1>
-            <p className="text-[11px] font-medium text-slate-400 mt-1">EV Showroom Hub</p>
+            <p className="text-[11px] font-medium text-slate-400 mt-1">Deen Dayak Tiwari · EV Showroom</p>
           </div>
         </div>
       </div>

@@ -1,8 +1,8 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useCRM } from '@/context/CRMContext';
-import { ServiceRecord, ServiceStatus, ServicePartUsed } from '@/types/crm';
+import { ServiceRecord, ServicePartUsed } from '@/types/crm';
 import { formatCurrency, formatDate, exportToCSV } from '@/lib/storage';
 import {
   Wrench,
@@ -12,12 +12,14 @@ import {
   Printer,
   CheckCircle2,
   Clock,
-  AlertTriangle,
   X,
   FileText,
   ShieldCheck,
   CheckSquare,
-  Square
+  Square,
+  Eye,
+  Pencil,
+  CalendarDays
 } from 'lucide-react';
 
 export default function ServicesView() {
@@ -28,16 +30,43 @@ export default function ServicesView() {
     spareParts,
     completeJobCard,
     scheduleService,
-    setSelectedServiceForJobCard
+    setSelectedServiceForJobCard,
+    syncFromMongoDB
   } = useCRM();
 
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('All');
   const [milestoneFilter, setMilestoneFilter] = useState<string>('All');
+  const [serviceError, setServiceError] = useState('');
+  const [savingService, setSavingService] = useState(false);
+  const [editingService, setEditingService] = useState<ServiceRecord | null>(null);
+  const [editForm, setEditForm] = useState({ dueDate: '', dueKm: '', customerComplaints: '' });
+  const serviceLoadPromise = useRef<Promise<void> | null>(null);
+
+  // Local override state to make Free-Service milestone chips clickable (toggle Pending ↔ Done)
+  const [localStatusOverrides, setLocalStatusOverrides] = useState<Record<string, 'Pending' | 'Done'>>({});
 
   // Modals
   const [isScheduleModalOpen, setIsScheduleModalOpen] = useState(false);
   const [completingService, setCompletingService] = useState<ServiceRecord | null>(null);
+
+  useEffect(() => {
+    if (!serviceLoadPromise.current) {
+      serviceLoadPromise.current = (async () => {
+        const response = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000'}/api/services`, {
+          credentials: 'include'
+        });
+        const result = await response.json();
+        if (!response.ok || (result && !Array.isArray(result) && !result.success)) {
+          throw new Error(result.message || 'Could not load service schedule.');
+        }
+        const refreshResult = await syncFromMongoDB();
+        if (!refreshResult.success) throw new Error(refreshResult.message);
+      })().catch(reason => {
+        setServiceError(reason instanceof Error ? reason.message : 'Could not load service schedule.');
+      });
+    }
+  }, [syncFromMongoDB]);
 
   // Completion Form State
   const [odometerReading, setOdometerReading] = useState<number>(1250);
@@ -76,10 +105,9 @@ export default function ServicesView() {
       (veh && veh.model.toLowerCase().includes(searchTerm.toLowerCase())) ||
       (veh && veh.chassisVin.toLowerCase().includes(searchTerm.toLowerCase()));
 
-    const matchesStatus =
-      statusFilter === 'All' ? true :
-      statusFilter === 'ActionRequired' ? (s.status === 'Due' || s.status === 'Overdue') :
-      s.status === statusFilter;
+    const status = serviceStatus(s);
+    const matchesStatus = statusFilter === 'All' ||
+      (statusFilter === 'ActionRequired' ? status !== 'Done' : status === statusFilter);
 
     const matchesMilestone =
       milestoneFilter === 'All' ? true :
@@ -88,7 +116,93 @@ export default function ServicesView() {
       String(s.serviceNumber) === milestoneFilter;
 
     return matchesSearch && matchesStatus && matchesMilestone;
+  }).sort((left, right) =>
+    left.dueDate.localeCompare(right.dueDate) ||
+    String(left.serviceNumber).localeCompare(String(right.serviceNumber))
+  );
+
+  function serviceStatus(service: ServiceRecord) {
+    if (service.status === 'Completed') return 'Done';
+    if (service.dueDate < new Date().toISOString().slice(0, 10)) return 'Overdue';
+    return 'Pending';
+  }
+
+  // ── Helper: get toggle-able status (Done / Pending) ────────────────────
+  function getToggleStatus(svc: ServiceRecord | undefined): 'Pending' | 'Done' | 'Not Scheduled' {
+    if (!svc) return 'Not Scheduled';
+    const base = serviceStatus(svc);
+    if (base === 'Overdue') return localStatusOverrides[svc.id] || 'Pending';
+    return localStatusOverrides[svc.id] || (base as 'Pending' | 'Done');
+  }
+
+  // ── Helper: toggle handler (Pending ↔ Done on click) ───────────────────
+  const handleToggleServiceStatus = (svc: ServiceRecord | undefined) => {
+    if (!svc) return;
+    const current = localStatusOverrides[svc.id] || serviceStatus(svc);
+    const next: 'Pending' | 'Done' = current === 'Done' ? 'Pending' : 'Done';
+    setLocalStatusOverrides(prev => ({ ...prev, [svc.id]: next }));
+    if (next === 'Done' && svc.status !== 'Completed') {
+      markServiceDone(svc);
+    }
+  };
+
+  // ── Per-customer free service lookup (Free #1 / #2 / #3) ───────────────
+  const customerFreeServicesMap: Record<string, Record<1 | 2 | 3, ServiceRecord | undefined>> = {};
+  customers.forEach(cust => {
+    const freeSrv = services.filter(s => s.customerId === cust.id && s.isFree);
+    customerFreeServicesMap[cust.id] = {
+      1: freeSrv.find(s => s.serviceNumber === 1),
+      2: freeSrv.find(s => s.serviceNumber === 2),
+      3: freeSrv.find(s => s.serviceNumber === 3),
+    };
   });
+
+  const saveServiceEdits = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!editingService) return;
+    setSavingService(true);
+    setServiceError('');
+    try {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000'}/api/services/${editingService.id}`, {
+        method: 'PUT',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          dueDate: editForm.dueDate,
+          dueKm: Number(editForm.dueKm),
+          customerComplaints: editForm.customerComplaints
+        })
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.message || 'Could not update service.');
+      const refreshResult = await syncFromMongoDB();
+      if (!refreshResult.success) throw new Error(refreshResult.message);
+      setEditingService(null);
+    } catch (reason) {
+      setServiceError(reason instanceof Error ? reason.message : 'Could not update service.');
+    } finally {
+      setSavingService(false);
+    }
+  };
+
+  const markServiceDone = async (service: ServiceRecord) => {
+    setSavingService(true);
+    setServiceError('');
+    try {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000'}/api/services/${service.id}/mark-done`, {
+        method: 'PATCH',
+        credentials: 'include'
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.message || 'Could not mark service done.');
+      const refreshResult = await syncFromMongoDB();
+      if (!refreshResult.success) throw new Error(refreshResult.message);
+    } catch (reason) {
+      setServiceError(reason instanceof Error ? reason.message : 'Could not mark service done.');
+    } finally {
+      setSavingService(false);
+    }
+  };
 
   const handleOpenCompleteModal = (srv: ServiceRecord) => {
     setCompletingService(srv);
@@ -168,21 +282,35 @@ export default function ServicesView() {
     setIsScheduleModalOpen(false);
   };
 
-  const statusBadge = (st: ServiceStatus) => {
-    switch (st) {
-      case 'Completed':
-        return 'bg-emerald-100 text-emerald-800 border-emerald-200';
-      case 'Due':
-        return 'bg-amber-100 text-amber-800 border-amber-200';
-      case 'Overdue':
-        return 'bg-rose-100 text-rose-800 border-rose-200 animate-pulse';
-      case 'Upcoming':
-        return 'bg-blue-50 text-blue-700 border-blue-200';
-      case 'In Progress':
-        return 'bg-purple-100 text-purple-800 border-purple-200';
-      case 'Missed':
-        return 'bg-slate-100 text-slate-700 border-slate-200';
-    }
+  // ── Reusable chip renderer for the 3 new table columns ────────────────
+  const renderFreeServiceChip = (svc: ServiceRecord | undefined, num: 1 | 2 | 3) => {
+    const status = getToggleStatus(svc);
+    const isDone = status === 'Done';
+    const isMissing = status === 'Not Scheduled';
+    return (
+      <button
+        type="button"
+        onClick={() => handleToggleServiceStatus(svc)}
+        disabled={isMissing || savingService}
+        title={isMissing ? `Free Service #${num} not scheduled` : `Click to toggle — currently ${status}`}
+        className={`inline-flex items-center justify-center gap-1 rounded-lg px-2 py-1 text-[10px] font-bold border transition ${
+          isMissing
+            ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+            : isDone
+              ? 'bg-emerald-100 text-emerald-800 border-emerald-300 hover:bg-emerald-200'
+              : 'bg-amber-100 text-amber-800 border-amber-300 hover:bg-amber-200'
+        }`}
+      >
+        {isDone ? (
+          <CheckCircle2 className="h-3 w-3" />
+        ) : isMissing ? (
+          <X className="h-3 w-3" />
+        ) : (
+          <Clock className="h-3 w-3" />
+        )}
+        <span>{isMissing ? 'N/A' : status}</span>
+      </button>
+    );
   };
 
   return (
@@ -239,104 +367,241 @@ export default function ServicesView() {
             All ({services.length})
           </button>
           <button
-            onClick={() => setStatusFilter('ActionRequired')}
-            className={`px-3 py-1.5 rounded-lg font-bold transition flex items-center gap-1.5 ${
-              statusFilter === 'ActionRequired' ? 'bg-amber-600 text-white' : 'bg-amber-50 text-amber-800 border border-amber-200'
+            onClick={() => setStatusFilter('Done')}
+            className={`px-3 py-1.5 rounded-lg font-semibold transition ${
+              statusFilter === 'Done' ? 'bg-emerald-700 text-white' : 'bg-emerald-50 text-emerald-800'
             }`}
           >
-            <AlertTriangle className="h-3.5 w-3.5" />
-            Due & Overdue
+            Done
           </button>
           <button
-            onClick={() => setStatusFilter('Completed')}
+            onClick={() => setStatusFilter('Pending')}
             className={`px-3 py-1.5 rounded-lg font-semibold transition ${
-              statusFilter === 'Completed' ? 'bg-emerald-700 text-white' : 'bg-emerald-50 text-emerald-800'
+              statusFilter === 'Pending' ? 'bg-blue-700 text-white' : 'bg-blue-50 text-blue-800'
             }`}
           >
-            Completed
+            Pending
           </button>
           <button
-            onClick={() => setStatusFilter('Upcoming')}
+            onClick={() => setStatusFilter('Overdue')}
             className={`px-3 py-1.5 rounded-lg font-semibold transition ${
-              statusFilter === 'Upcoming' ? 'bg-blue-700 text-white' : 'bg-blue-50 text-blue-800'
+              statusFilter === 'Overdue' ? 'bg-rose-700 text-white' : 'bg-rose-50 text-rose-800'
             }`}
           >
-            Upcoming
+            Overdue
           </button>
         </div>
       </div>
 
-      {/* Services Table */}
+      {serviceError && (
+        <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          <span>{serviceError}</span>
+          <button type="button" onClick={() => setServiceError('')} className="font-bold">Dismiss</button>
+        </div>
+      )}
+
+      {/* ═══════════════════════════════════════════════════════════════════
+          Quick per-customer 3 Free Service Milestones overview
+      ═══════════════════════════════════════════════════════════════════ */}
+      <div className="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-4 sm:p-5">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-3 pb-3 border-b border-slate-100">
+          <h2 className="font-bold text-slate-900 text-sm flex items-center gap-2">
+            <ShieldCheck className="h-4 w-4 text-emerald-600" />
+            3 Free Service Milestones — Per Customer
+          </h2>
+          <p className="text-[10px] sm:text-[11px] text-slate-500">
+            Tap any chip to toggle <span className="font-semibold text-emerald-700">Done</span> / <span className="font-semibold text-amber-700">Pending</span>
+          </p>
+        </div>
+
+        <div className="space-y-2.5">
+          {customers.map(cust => {
+            const custVehicles = vehicles.filter(
+              v => cust.vehicleIds.includes(v.id) || v.assignedCustomerId === cust.id
+            );
+            if (!custVehicles.length) return null;
+            const veh = custVehicles[0];
+            const freeSrv = customerFreeServicesMap[cust.id] || { 1: undefined, 2: undefined, 3: undefined };
+
+            return (
+              <div key={cust.id} className="rounded-xl border border-slate-200 bg-slate-50/40 p-3">
+                <div className="mb-2 min-w-0">
+                  <p className="font-bold text-slate-900 text-xs truncate">{cust.name}</p>
+                  <p className="text-[10px] text-slate-500 font-mono truncate">
+                    {veh.modelNumber || veh.model} · {veh.chassisVin}
+                  </p>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  {([1, 2, 3] as const).map(num => {
+                    const svc = freeSrv[num];
+                    const status = getToggleStatus(svc);
+                    const isDone = status === 'Done';
+                    const isMissing = status === 'Not Scheduled';
+                    return (
+                      <button
+                        key={num}
+                        type="button"
+                        onClick={() => handleToggleServiceStatus(svc)}
+                        disabled={isMissing}
+                        className={`group relative text-left p-3 rounded-xl border-2 transition-all duration-200 ${
+                          isMissing
+                            ? 'bg-slate-50 border-dashed border-slate-200 cursor-not-allowed opacity-70'
+                            : isDone
+                              ? 'bg-emerald-50 border-emerald-300 hover:border-emerald-500 hover:shadow-md'
+                              : 'bg-white border-slate-200 hover:border-amber-400 hover:shadow-md'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2 mb-1">
+                          <span className="text-[10px] font-bold uppercase tracking-wide text-slate-500">
+                            Free #{num}
+                          </span>
+                          <span
+                            className={`h-5 w-5 rounded-md flex items-center justify-center ${
+                              isDone
+                                ? 'bg-emerald-600 text-white'
+                                : isMissing
+                                  ? 'bg-slate-200 text-slate-400'
+                                  : 'bg-amber-100 text-amber-700'
+                            }`}
+                          >
+                            {isDone ? <CheckCircle2 className="h-3.5 w-3.5" /> : <Clock className="h-3.5 w-3.5" />}
+                          </span>
+                        </div>
+                        <p
+                          className={`text-sm font-bold ${
+                            isMissing ? 'text-slate-400' : isDone ? 'text-emerald-700' : 'text-slate-900'
+                          }`}
+                        >
+                          {isMissing ? 'Not Scheduled' : status}
+                        </p>
+                        {svc ? (
+                          <p className="text-[10px] text-slate-500 mt-0.5">Due: {formatDate(svc.dueDate)}</p>
+                        ) : (
+                          <p className="text-[10px] text-slate-400 mt-0.5 italic">No record yet</p>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* ═══════════════════════════════════════════════════════════════════
+          Services Table — with 3 new Free Service columns added
+      ═══════════════════════════════════════════════════════════════════ */}
       <div className="bg-white rounded-2xl border border-slate-200/80 shadow-xs overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse text-xs">
+          <table className="w-full min-w-[1240px] text-left border-collapse text-xs">
             <thead>
-              <tr className="bg-slate-50 text-slate-600 font-bold border-b border-slate-200 uppercase tracking-wider text-[10px]">
-                <th className="p-3.5">Job Card</th>
-                <th className="p-3.5">Customer & Contact</th>
-                <th className="p-3.5">Vehicle</th>
-                <th className="p-3.5">Milestone</th>
-                <th className="p-3.5">Due Date & Km</th>
-                <th className="p-3.5 text-center">Status</th>
-                <th className="p-3.5 text-right">Customer Bill</th>
-                <th className="p-3.5 text-center">Actions</th>
+              <tr className="bg-slate-100 text-slate-700 font-bold border-b-2 border-slate-300 uppercase tracking-wider text-[10px]">
+                <th className="border border-slate-300 px-3 py-3">Customer Name</th>
+                <th className="border border-slate-300 px-3 py-3">Scooty Model</th>
+                <th className="border border-slate-300 px-3 py-3">Chassis Number</th>
+                <th className="border border-slate-300 px-3 py-3">Service Due Date</th>
+                <th className="border border-slate-300 px-3 py-3">Service Type</th>
+                {/* ── 3 NEW COLUMNS: Free Service Milestones ── */}
+                <th className="border border-slate-300 px-2 py-3 text-center">Free #1</th>
+                <th className="border border-slate-300 px-2 py-3 text-center">Free #2</th>
+                <th className="border border-slate-300 px-2 py-3 text-center">Free #3</th>
+                {/* ── Existing columns continue ── */}
+                <th className="border border-slate-300 px-3 py-3 text-center">Status</th>
+                <th className="border border-slate-300 px-3 py-3 text-center">Actions</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
+            <tbody>
               {filteredServices.length > 0 ? (
-                filteredServices.map((srv) => {
+                filteredServices.map((srv, rowIndex) => {
                   const cust = customers.find(c => c.id === srv.customerId);
                   const veh = vehicles.find(v => v.id === srv.vehicleId);
+                  const currentStatus = serviceStatus(srv);
+                  const custFreeSrv = customerFreeServicesMap[srv.customerId] || { 1: undefined, 2: undefined, 3: undefined };
 
                   return (
-                    <tr key={srv.id} className="hover:bg-slate-50/70 transition">
-                      <td className="p-3.5 font-mono font-bold text-slate-900">
-                        {srv.jobCardNumber}
-                      </td>
-                      <td className="p-3.5">
-                        <div className="font-bold text-slate-900">{cust?.name}</div>
-                        <div className="text-[10px] text-slate-500 font-mono">{cust?.phone}</div>
-                      </td>
-                      <td className="p-3.5">
-                        <div className="font-bold text-slate-900">{veh?.brand} {veh?.model}</div>
-                        <div className="text-[10px] font-mono text-slate-400">{veh?.chassisVin}</div>
-                      </td>
-                      <td className="p-3.5">
-                        <span className={`inline-block px-2 py-0.5 rounded font-bold text-[10px] ${
+                    <tr key={srv.id} className={`${rowIndex % 2 ? 'bg-slate-50/60' : 'bg-white'} hover:bg-amber-50/60`}>
+                      <td className="border border-slate-200 px-3 py-3 font-semibold text-slate-900">{cust?.name || 'Customer record unavailable'}</td>
+                      <td className="border border-slate-200 px-3 py-3 font-semibold text-slate-900">{veh?.modelNumber || veh?.model || 'Scooter unavailable'}</td>
+                      <td className="border border-slate-200 px-3 py-3 font-mono text-slate-700">{veh?.chassisVin || '—'}</td>
+                      <td className="border border-slate-200 px-3 py-3 whitespace-nowrap text-slate-800">{formatDate(srv.dueDate)}</td>
+                      <td className="border border-slate-200 px-3 py-3">
+                        <span className={`inline-block rounded border px-2 py-1 font-bold text-[10px] ${
                           srv.isFree ? 'bg-blue-50 text-blue-800' : 'bg-slate-100 text-slate-700'
                         }`}>
                           {srv.isFree ? `Free Service #${srv.serviceNumber}` : 'Paid Service'}
                         </span>
+                        <span className="ml-2 text-slate-500">{srv.jobCardNumber}</span>
                       </td>
-                      <td className="p-3.5">
-                        <div className="font-semibold text-slate-800">{formatDate(srv.dueDate)}</div>
-                        <div className="text-[10px] text-slate-500 font-mono">{srv.dueKm} km threshold</div>
+
+                      {/* ── 3 NEW COLUMNS: Free #1, #2, #3 toggle chips ── */}
+                      <td className="border border-slate-200 px-2 py-2 text-center">
+                        {renderFreeServiceChip(custFreeSrv[1], 1)}
                       </td>
-                      <td className="p-3.5 text-center">
-                        <span className={`inline-block px-2.5 py-0.5 rounded-full text-[10px] font-bold border ${statusBadge(srv.status)}`}>
-                          {srv.status}
+                      <td className="border border-slate-200 px-2 py-2 text-center">
+                        {renderFreeServiceChip(custFreeSrv[2], 2)}
+                      </td>
+                      <td className="border border-slate-200 px-2 py-2 text-center">
+                        {renderFreeServiceChip(custFreeSrv[3], 3)}
+                      </td>
+
+                      <td className="border border-slate-200 px-3 py-3 text-center">
+                        <span className={`inline-block rounded-full border px-2.5 py-1 text-[10px] font-bold ${
+                          currentStatus === 'Done'
+                            ? 'border-emerald-200 bg-emerald-100 text-emerald-800'
+                            : currentStatus === 'Overdue'
+                              ? 'border-rose-200 bg-rose-100 text-rose-800'
+                              : 'border-amber-200 bg-amber-50 text-amber-800'
+                        }`}>
+                          {currentStatus}
                         </span>
                       </td>
-                      <td className="p-3.5 text-right font-mono font-bold text-slate-900">
-                        {formatCurrency(srv.totalCustomerPayable)}
-                      </td>
-                      <td className="p-3.5 text-center">
-                        <div className="flex items-center justify-center gap-1.5">
+                      <td className="border border-slate-200 px-3 py-2">
+                        <div className="flex min-w-[280px] flex-wrap items-center justify-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => setSelectedServiceForJobCard(srv)}
+                            className="inline-flex items-center gap-1 rounded-lg border border-slate-300 bg-white px-2 py-1.5 font-semibold text-slate-700 hover:bg-slate-100"
+                          >
+                            <Eye className="h-3.5 w-3.5" /> View
+                          </button>
+                          {srv.status !== 'Completed' && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setEditingService(srv);
+                                setEditForm({
+                                  dueDate: srv.dueDate,
+                                  dueKm: String(srv.dueKm),
+                                  customerComplaints: srv.customerComplaints || ''
+                                });
+                              }}
+                              className="inline-flex items-center gap-1 rounded-lg border border-blue-200 bg-blue-50 px-2 py-1.5 font-semibold text-blue-800 hover:bg-blue-100"
+                            >
+                              <Pencil className="h-3.5 w-3.5" /> Edit
+                            </button>
+                          )}
+                          {srv.status !== 'Completed' && (
+                            <button
+                              type="button"
+                              disabled={savingService}
+                              onClick={() => markServiceDone(srv)}
+                              className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 px-2 py-1.5 font-bold text-white hover:bg-emerald-700 disabled:opacity-50"
+                            >
+                              <CheckCircle2 className="h-3.5 w-3.5" /> Mark Done
+                            </button>
+                          )}
                           {srv.status !== 'Completed' ? (
                             <button
                               onClick={() => handleOpenCompleteModal(srv)}
-                              className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-600 text-slate-950 font-bold text-[11px] shadow-2xs transition"
+                              className="inline-flex items-center gap-1 rounded-lg bg-amber-500 px-2 py-1.5 font-bold text-slate-950 hover:bg-amber-600"
                             >
-                              Work & Bill
+                              <Wrench className="h-3.5 w-3.5" /> Work & Bill
                             </button>
                           ) : (
-                            <button
-                              onClick={() => setSelectedServiceForJobCard(srv)}
-                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-100 font-medium transition text-[11px]"
-                            >
-                              <Printer className="h-3 w-3 text-amber-600" />
-                              <span>Job Card</span>
-                            </button>
+                            <span className="inline-flex items-center gap-1 rounded-lg bg-emerald-50 px-2 py-1.5 font-semibold text-emerald-800">
+                              <CheckCircle2 className="h-3.5 w-3.5" /> Done
+                            </span>
                           )}
                         </div>
                       </td>
@@ -345,7 +610,7 @@ export default function ServicesView() {
                 })
               ) : (
                 <tr>
-                  <td colSpan={8} className="p-8 text-center text-slate-400">
+                  <td colSpan={10} className="border border-slate-200 p-8 text-center text-slate-400">
                     No service records found.
                   </td>
                 </tr>
@@ -354,6 +619,65 @@ export default function ServicesView() {
           </table>
         </div>
       </div>
+
+      {editingService && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-900/60 p-3 backdrop-blur-sm sm:p-6">
+          <div className="my-4 w-full max-w-xl rounded-2xl bg-white p-5 shadow-2xl sm:p-6">
+            <div className="mb-4 flex items-start justify-between gap-3 border-b border-slate-100 pb-3">
+              <div>
+                <h2 className="flex items-center gap-2 text-base font-bold text-slate-900">
+                  <CalendarDays className="h-4 w-4 text-blue-600" /> Edit Service Schedule
+                </h2>
+                <p className="mt-1 text-xs text-slate-500">{editingService.jobCardNumber} · {editingService.isFree ? `Free Service ${editingService.serviceNumber}` : 'Paid Service'}</p>
+              </div>
+              <button type="button" onClick={() => setEditingService(null)} aria-label="Close edit service" className="rounded-lg p-2 text-slate-500 hover:bg-slate-100">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <form onSubmit={saveServiceEdits} className="space-y-4">
+              <label className="block text-xs font-semibold text-slate-700">
+                Service due date
+                <input
+                  type="date"
+                  required
+                  value={editForm.dueDate}
+                  onChange={event => setEditForm(previous => ({ ...previous, dueDate: event.target.value }))}
+                  className="mt-1 block w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm"
+                />
+              </label>
+              <label className="block text-xs font-semibold text-slate-700">
+                Due at (km)
+                <input
+                  type="number"
+                  min="0"
+                  required
+                  value={editForm.dueKm}
+                  onChange={event => setEditForm(previous => ({ ...previous, dueKm: event.target.value }))}
+                  className="mt-1 block w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm"
+                />
+              </label>
+              <label className="block text-xs font-semibold text-slate-700">
+                Service notes / customer complaint
+                <textarea
+                  rows={3}
+                  maxLength={1000}
+                  value={editForm.customerComplaints}
+                  onChange={event => setEditForm(previous => ({ ...previous, customerComplaints: event.target.value }))}
+                  className="mt-1 block w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm"
+                />
+              </label>
+              <div className="flex flex-col-reverse gap-2 border-t border-slate-100 pt-4 sm:flex-row sm:justify-end">
+                <button type="button" onClick={() => setEditingService(null)} className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-50">
+                  Cancel
+                </button>
+                <button type="submit" disabled={savingService} className="rounded-xl bg-blue-600 px-4 py-2 text-sm font-bold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50">
+                  {savingService ? 'Saving...' : 'Save Changes'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* Complete Job Card & Billing Modal */}
       {completingService && (
@@ -403,7 +727,7 @@ export default function ServicesView() {
               <div>
                 <label className="font-semibold text-slate-700 block mb-1">Customer Complaints</label>
                 <div className="p-2.5 bg-slate-100 rounded-xl text-slate-700 italic">
-                  "{completingService.customerComplaints}"
+                  &quot;{completingService.customerComplaints}&quot;
                 </div>
               </div>
 

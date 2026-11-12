@@ -41,6 +41,8 @@ export default function EMIView() {
   const [collectAmount, setCollectAmount] = useState<number>(0);
   const [collectMethod, setCollectMethod] = useState<'Cash' | 'UPI' | 'Bank Transfer' | 'Cheque'>('UPI');
   const [collectNotes, setCollectNotes] = useState<string>('');
+  const [paymentError, setPaymentError] = useState('');
+  const [isSubmittingPayment, setIsSubmittingPayment] = useState(false);
 
   const filteredSchedules = emiSchedules.filter(sch => {
     const cust = customers.find(c => c.id === sch.customerId);
@@ -66,11 +68,13 @@ export default function EMIView() {
     setCollectNotes(`Installment #${inst.installmentNo} collection`);
   };
 
-  const handleConfirmPayment = (e: React.FormEvent) => {
+  const handleConfirmPayment = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!paymentModalState) return;
+    setPaymentError('');
+    setIsSubmittingPayment(true);
 
-    const res = recordEMIPayment({
+    const res = await recordEMIPayment({
       emiScheduleId: paymentModalState.emi.id,
       installmentNo: paymentModalState.installment.installmentNo,
       paidAmount: collectAmount,
@@ -84,7 +88,10 @@ export default function EMIView() {
         installmentNo: paymentModalState.installment.installmentNo
       });
       setPaymentModalState(null);
+    } else {
+      setPaymentError(res.message || 'Could not record payment.');
     }
+    setIsSubmittingPayment(false);
   };
 
   const statusBadge = (st: InstallmentStatus) => {
@@ -375,6 +382,7 @@ export default function EMIView() {
             </div>
 
             <form onSubmit={handleConfirmPayment} className="mt-4 space-y-3 text-xs">
+              {paymentError && <p role="alert" className="rounded-lg border border-rose-200 bg-rose-50 p-2.5 text-rose-700">{paymentError}</p>}
               <div className="p-3 rounded-xl bg-purple-50/50 border border-purple-200">
                 <p className="text-slate-600">Installment <strong className="text-slate-900">#{paymentModalState.installment.installmentNo}</strong></p>
                 <p className="text-slate-600">Total Installment Due: <strong className="font-mono text-slate-900">{formatCurrency(paymentModalState.installment.amount)}</strong></p>
@@ -427,9 +435,10 @@ export default function EMIView() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold"
+                  disabled={isSubmittingPayment}
+                  className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold disabled:opacity-60"
                 >
-                  Confirm & Generate Receipt
+                  {isSubmittingPayment ? 'Saving payment…' : 'Confirm & Generate Receipt'}
                 </button>
               </div>
             </form>

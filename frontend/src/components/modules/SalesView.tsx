@@ -62,6 +62,19 @@ export default function SalesView() {
   });
 
   const [formError, setFormError] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  React.useEffect(() => {
+    if (!customers.some(customer => customer.id === selectedCustomerId)) {
+      setSelectedCustomerId(customers[0]?.id || '');
+    }
+  }, [customers, selectedCustomerId]);
+
+  React.useEffect(() => {
+    if (!vehicles.some(vehicle => vehicle.id === selectedVehicleId && vehicle.status === 'Available')) {
+      setSelectedVehicleId(availableVehicles[0]?.id || '');
+    }
+  }, [vehicles, selectedVehicleId]);
 
   // Selected vehicle pricing calculation
   const targetVehicle = vehicles.find(v => v.id === selectedVehicleId);
@@ -108,7 +121,7 @@ export default function SalesView() {
     fileInputRef.current?.click();
   };
 
-  const handleCreateSale = (e: React.FormEvent) => {
+  const handleCreateSale = async (e: React.FormEvent) => {
     e.preventDefault();
     setFormError('');
 
@@ -121,37 +134,43 @@ export default function SalesView() {
       return;
     }
 
-    const res = recordSale({
-      customerId: selectedCustomerId,
-      vehicleId: selectedVehicleId,
-      saleDate,
-      exShowroomPrice: exShowroom,
-      discount,
-      gstAmount,
-      accessoriesAmount,
-      insuranceAmount,
-      registrationAmount,
-      totalOnRoadPrice,
-      bookingAmount,
-      downPayment,
-      financingType,
-      financeCompanyName: financingType !== 'Cash/Self' ? financeCompanyName : undefined,
-      loanAccountRef: financingType !== 'Cash/Self' ? loanAccountRef || `LN-EV-${Date.now().toString().slice(-4)}` : undefined,
-      financedAmount,
-      salespersonName,
-      deliveryDate,
-      deliveryChecklist: checklist,
-      handoverNotes,
-      emiTenureMonths,
-      emiInterestRate: financingType === 'ShowroomDirect' ? 0 : 10.5
-    });
+    setIsSubmitting(true);
+    try {
+      const res = await recordSale({
+        customerId: selectedCustomerId,
+        vehicleId: selectedVehicleId,
+        saleDate,
+        exShowroomPrice: exShowroom,
+        discount,
+        gstAmount,
+        accessoriesAmount,
+        insuranceAmount,
+        registrationAmount,
+        totalOnRoadPrice,
+        bookingAmount,
+        downPayment,
+        financingType,
+        financeCompanyName: financingType !== 'Cash/Self' ? financeCompanyName : undefined,
+        loanAccountRef: financingType !== 'Cash/Self' ? loanAccountRef || `LN-EV-${Date.now().toString().slice(-4)}` : undefined,
+        financedAmount,
+        salespersonName,
+        deliveryDate,
+        deliveryChecklist: checklist,
+        handoverNotes,
+        emiTenureMonths,
+        emiInterestRate: financingType === 'ShowroomDirect' ? 0 : 10.5
+      });
 
-    if (!res.success) {
-      setFormError(res.message || 'Failed to finalize sale');
-      return;
+      if (!res.success) {
+        setFormError(res.message || 'Failed to finalize sale');
+        return;
+      }
+      setIsNewSaleOpen(false);
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : 'Failed to finalize sale.');
+    } finally {
+      setIsSubmitting(false);
     }
-
-    setIsNewSaleOpen(false);
   };
 
   return (
@@ -562,9 +581,10 @@ export default function SalesView() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold shadow-md shadow-emerald-500/20"
+                  disabled={isSubmitting || availableVehicles.length === 0}
+                  className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60 text-white font-bold shadow-md shadow-emerald-500/20"
                 >
-                  Finalize Sale & Print Invoice
+                  {isSubmitting ? 'Finalizing Sale...' : 'Finalize Sale & Print Invoice'}
                 </button>
               </div>
             </form>
