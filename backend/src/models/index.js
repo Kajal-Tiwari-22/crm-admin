@@ -72,6 +72,15 @@ const CustomerSchema = new Schema({
   pincode: { type: String, default: '' },
   aadhaarNumber: { type: String, default: '' },
   panNumber: { type: String, default: '' },
+  currentAddress: { type: String, default: '' },
+  permanentAddress: { type: String, default: '' },
+  guarantorRequired: { type: Boolean, default: false },
+  guarantor: {
+    name: { type: String, default: '' },
+    phone: { type: String, default: '' },
+    address: { type: String, default: '' }
+  },
+  archivedAt: { type: String, default: null },
   documents: { type: Array, default: [] },
   vehicleIds: { type: [String], default: [] },
   notes: { type: String, default: '' },
@@ -82,7 +91,7 @@ const CustomerSchema = new Schema({
 // Sale Schema
 const SaleSchema = new Schema({
   id: { type: String, required: true, unique: true },
-  invoiceNumber: { type: String, required: true },
+  invoiceNumber: { type: String, required: true, unique: true },
   customerId: { type: String, required: true },
   vehicleId: { type: String, required: true },
   saleDate: { type: String, required: true },
@@ -99,6 +108,19 @@ const SaleSchema = new Schema({
   financeCompanyName: { type: String, default: '' },
   loanAccountRef: { type: String, default: '' },
   financedAmount: { type: Number, default: 0 },
+  modelNumber: { type: String, default: '' },
+  companyName: { type: String, default: '' },
+  chassisVin: { type: String, default: '' },
+  batterySerial: { type: String, default: '' },
+  purchaseCostSnapshot: { type: Number, default: 0 },
+  finalSellingPrice: { type: Number, default: 0 },
+  remainingAmount: { type: Number, default: 0 },
+  financeStatus: { type: String, default: '' },
+  firstDueDate: { type: String, default: '' },
+  paymentDay: { type: Number, default: null },
+  paymentFrequency: { type: String, default: '' },
+  installmentSchedule: { type: Array, default: [] },
+  paymentLedger: { type: Array, default: [] },
   pendingDocuments: { type: [String], default: [] },
   deliveryStatus: { type: String, enum: ['Pending', 'Ready', 'Delivered', 'Handed Over'], default: 'Handed Over' },
   deliveryDate: { type: String, default: '' },
@@ -110,6 +132,7 @@ const SaleSchema = new Schema({
   handoverNotes: { type: String, default: '' },
   createdAt: { type: String, default: () => new Date().toISOString() }
 }, { timestamps: true, strict: false });
+SaleSchema.index({ vehicleId: 1 }, { unique: true });
 
 // Service Record Schema
 const ServiceRecordSchema = new Schema({

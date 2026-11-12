@@ -1,5 +1,9 @@
-require('dotenv').config();
+const path = require('path');
+const backendEnvPath = path.resolve(__dirname, '..', '.env');
+const envLoadResult = require('dotenv').config({ path: backendEnvPath, override: true });
 const http = require('http');
+const crypto = require('crypto');
+const mongoose = require('mongoose');
 const express = require('express');
 const cors = require('cors');
 const { Server } = require('socket.io');
@@ -11,6 +15,30 @@ const {
 } = require('./models');
 const { sendWhatsAppReminder } = require('./services/whatsapp');
 const seedData = require('./data/seedData.cjs');
+const { authenticateAdmin, clearSessionCookie, createSessionCookie, isValidSession } = require('./services/auth');
+
+const FRONTEND_ORIGIN = new URL(
+  process.env.FRONTEND_ORIGIN || 'http://localhost:3000'
+).origin;
+
+function getAuthConfigurationIssues() {
+  const issues = [];
+  if (!(process.env.ADMIN_EMAIL || '').trim()) issues.push('ADMIN_EMAIL');
+  if (!process.env.ADMIN_PASSWORD) issues.push('ADMIN_PASSWORD');
+  if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) {
+    issues.push('SESSION_SECRET (at least 32 characters)');
+  }
+  return issues;
+}
+
+if (envLoadResult.error) {
+  console.error(`[Auth] Could not load backend environment file at ${backendEnvPath}: ${envLoadResult.error.message}`);
+} else {
+  const issues = getAuthConfigurationIssues();
+  console.log(issues.length === 0
+    ? '[Auth] Admin authentication configuration loaded.'
+    : `[Auth] Admin authentication configuration is incomplete: ${issues.join(', ')}.`);
+}
 
 const app = express();
 const server = http.createServer(app);
@@ -18,13 +46,27 @@ const server = http.createServer(app);
 // Configure Socket.io with wide CORS for local dev & production
 const io = new Server(server, {
   cors: {
-    origin: '*',
+    origin: FRONTEND_ORIGIN,
+    credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH']
   }
 });
 
+io.use((socket, next) => {
+  try {
+    if (isValidSession(socket.handshake.headers.cookie)) return next();
+    return next(new Error('Authentication required'));
+  } catch (error) {
+    console.error('[Socket] Authentication validation failed:', error.message);
+    return next(new Error('Authentication is not configured'));
+  }
+});
+
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: FRONTEND_ORIGIN,
+  credentials: true
+}));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
@@ -64,7 +106,14 @@ async function broadcastFullSync() {
       reminders, leads, spareParts, suppliers, purchaseOrders,
       warrantyInsurance, expenses,
       settings: settings || seedData.initialSettings,
-      staff: seedData.initialStaff,
+      staff: [{
+        id: 'admin',
+        name: process.env.ADMIN_NAME || 'Deen Dayak Tiwari',
+        email: (process.env.ADMIN_EMAIL || '').trim().toLowerCase(),
+        role: 'Owner',
+        phone: '',
+        isActive: true
+      }],
       auditLogs
     };
 
@@ -93,16 +142,78 @@ async function ensureSettings() {
 // API ROUTES
 // ==========================================
 
+app.post('/api/auth/login', (req, res) => {
+  const configurationIssues = getAuthConfigurationIssues();
+  const expectedEmail = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+  const expectedPassword = process.env.ADMIN_PASSWORD || '';
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  const providedPassword = Buffer.from(password);
+  const configuredPassword = Buffer.from(expectedPassword);
+  const passwordMatches = configuredPassword.length > 0 &&
+    providedPassword.length === configuredPassword.length &&
+    crypto.timingSafeEqual(providedPassword, configuredPassword);
+
+  if (configurationIssues.length > 0) {
+    return res.status(503).json({
+      success: false,
+      message: `Admin authentication is not configured on the server. Check backend/.env: ${configurationIssues.join(', ')}. Restart the backend after updating it.`
+    });
+  }
+  if (email !== expectedEmail || !passwordMatches) {
+    return res.status(401).json({ success: false, message: 'Invalid email or password.' });
+  }
+
+  res.setHeader('Set-Cookie', createSessionCookie());
+  res.json({ success: true, user: { name: process.env.ADMIN_NAME || 'Administrator', email: expectedEmail, role: 'Owner' } });
+});
+
+app.get('/api/auth/session', (req, res) => {
+  try {
+    if (!isValidSession(req.headers.cookie)) {
+      return res.status(401).json({ success: false, message: 'Sign in to continue.' });
+    }
+    return res.json({
+      success: true,
+      user: {
+        name: process.env.ADMIN_NAME || 'Administrator',
+        email: (process.env.ADMIN_EMAIL || '').trim().toLowerCase(),
+        role: 'Owner'
+      }
+    });
+  } catch (error) {
+    console.error('[Auth] Session check failed:', error.message);
+    return res.status(503).json({ success: false, message: 'Authentication is not configured.' });
+  }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  res.setHeader('Set-Cookie', clearSessionCookie());
+  res.json({ success: true });
+});
+
 // Health Check
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
+    adminAuthenticationConfigured: getAuthConfigurationIssues().length === 0,
     database: 'MongoDB Atlas',
     cluster: 'auto-shop',
     realTime: 'Socket.io Active',
     whatsappService: 'WhatsApp Reminders Active',
     timestamp: new Date().toISOString()
   });
+});
+
+app.use('/api', (req, res, next) => {
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+    const origin = req.get('origin');
+    const expectedOrigin = FRONTEND_ORIGIN;
+    if (origin && origin !== expectedOrigin) {
+      return res.status(403).json({ success: false, message: 'Request origin is not allowed.' });
+    }
+  }
+  return authenticateAdmin(req, res, next);
 });
 
 // Get Full Database Snapshot (for instant hydration)
@@ -137,7 +248,14 @@ app.get('/api/all', async (req, res) => {
         reminders, leads, spareParts, suppliers, purchaseOrders,
         warrantyInsurance, expenses,
         settings: settings || seedData.initialSettings,
-        staff: seedData.initialStaff,
+        staff: [{
+          id: 'admin',
+          name: process.env.ADMIN_NAME || 'Deen Dayak Tiwari',
+          email: (process.env.ADMIN_EMAIL || '').trim().toLowerCase(),
+          role: 'Owner',
+          phone: '',
+          isActive: true
+        }],
         auditLogs
       }
     });
@@ -199,8 +317,32 @@ app.post('/api/sync-push', async (req, res) => {
     const localDb = req.body;
     if (!localDb) return res.status(400).json({ success: false, message: 'No payload provided' });
 
+    if (Array.isArray(localDb.sales)) {
+      const storedSales = await Sale.find().select('id').lean();
+      const storedSaleIds = new Set(storedSales.map(sale => sale.id));
+      if (localDb.sales.some(sale => !sale.id || !storedSaleIds.has(sale.id))) {
+        return res.status(409).json({
+          success: false,
+          message: 'Sales must be created through the transactional customer-sales endpoint.'
+        });
+      }
+    }
+
     if (localDb.vehicles && Array.isArray(localDb.vehicles)) {
       for (const v of localDb.vehicles) {
+        const storedVehicle = await Vehicle.findOne({ id: v.id }).select('status').lean();
+        if (v.status === 'Sold' && storedVehicle?.status !== 'Sold') {
+          return res.status(409).json({
+            success: false,
+            message: 'Scooters can only be marked sold through the transactional customer-sales endpoint.'
+          });
+        }
+        if (storedVehicle?.status === 'Sold' && v.status !== 'Sold' && await Sale.exists({ vehicleId: v.id })) {
+          return res.status(409).json({
+            success: false,
+            message: 'A scooter with a completed sale cannot be returned to available stock.'
+          });
+        }
         await Vehicle.findOneAndUpdate({ id: v.id }, v, { upsert: true, new: true });
       }
     }
@@ -211,7 +353,16 @@ app.post('/api/sync-push', async (req, res) => {
     }
     if (localDb.sales && Array.isArray(localDb.sales)) {
       for (const s of localDb.sales) {
-        await Sale.findOneAndUpdate({ id: s.id }, s, { upsert: true, new: true });
+        const updates = {};
+        for (const field of ['deliveryStatus', 'deliveryDate', 'registrationNumber', 'deliveryChecklist', 'uploadedInvoiceFile', 'handoverNotes']) {
+          if (s[field] !== undefined) updates[field] = s[field];
+        }
+        await Sale.findOneAndUpdate({ id: s.id }, updates, { new: true });
+      }
+    }
+    if (localDb.inventoryBatches && Array.isArray(localDb.inventoryBatches)) {
+      for (const batch of localDb.inventoryBatches) {
+        await InventoryBatch.findOneAndUpdate({ id: batch.id }, batch, { upsert: true, new: true });
       }
     }
     if (localDb.services && Array.isArray(localDb.services)) {
@@ -238,6 +389,26 @@ app.post('/api/sync-push', async (req, res) => {
       for (const sp of localDb.spareParts) {
         await SparePart.findOneAndUpdate({ id: sp.id }, sp, { upsert: true, new: true });
       }
+      if (localDb.suppliers && Array.isArray(localDb.suppliers)) {
+        for (const supplier of localDb.suppliers) {
+          await Supplier.findOneAndUpdate({ id: supplier.id }, supplier, { upsert: true, new: true });
+        }
+      }
+      if (localDb.purchaseOrders && Array.isArray(localDb.purchaseOrders)) {
+        for (const order of localDb.purchaseOrders) {
+          await PurchaseOrder.findOneAndUpdate({ id: order.id }, order, { upsert: true, new: true });
+        }
+      }
+      if (localDb.warrantyInsurance && Array.isArray(localDb.warrantyInsurance)) {
+        for (const warranty of localDb.warrantyInsurance) {
+          await WarrantyInsurance.findOneAndUpdate({ id: warranty.id }, warranty, { upsert: true, new: true });
+        }
+      }
+      if (localDb.auditLogs && Array.isArray(localDb.auditLogs)) {
+        for (const log of localDb.auditLogs) {
+          await AuditLog.findOneAndUpdate({ id: log.id }, log, { upsert: true, new: true });
+        }
+      }
     }
     if (localDb.expenses && Array.isArray(localDb.expenses)) {
       for (const exp of localDb.expenses) {
@@ -258,6 +429,32 @@ app.post('/api/sync-push', async (req, res) => {
 // ==========================================
 // VEHICLES (INDIVIDUAL UNITS)
 // ==========================================
+app.get('/api/available-scooters', async (req, res) => {
+  try {
+    const units = await Vehicle.find({ status: 'Available' })
+      .select('id brand model modelNumber color lightType companyName chassisVin batterySerial sellingPrice purchasePrice inventoryBatchId')
+      .sort({ modelNumber: 1, companyName: 1 });
+    const models = new Map();
+    for (const unit of units) {
+      const modelNumber = unit.modelNumber || unit.model;
+      const key = `${unit.companyName || unit.brand}:${modelNumber}`;
+      const model = models.get(key) || {
+        key,
+        modelNumber,
+        companyName: unit.companyName || unit.brand,
+        lightType: unit.lightType || '',
+        availableQty: 0,
+        suggestedPrice: unit.sellingPrice || 0
+      };
+      model.availableQty += 1;
+      models.set(key, model);
+    }
+    res.json({ success: true, data: { models: Array.from(models.values()), units } });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 app.get('/api/vehicles', async (req, res) => {
   const vehicles = await Vehicle.find().sort({ createdAt: -1 });
   res.json(vehicles);
@@ -265,6 +462,12 @@ app.get('/api/vehicles', async (req, res) => {
 
 app.post('/api/vehicles', async (req, res) => {
   try {
+    if (req.body.status === 'Sold') {
+      return res.status(409).json({
+        success: false,
+        message: 'Scooters can only be marked sold through the transactional customer-sales endpoint.'
+      });
+    }
     const vin = (req.body.chassisVin || '').trim().toUpperCase();
     if (!vin) return res.status(400).json({ success: false, message: 'Chassis number is required.' });
     const existing = await Vehicle.findOne({ chassisVin: vin });
@@ -291,6 +494,21 @@ app.post('/api/vehicles', async (req, res) => {
 
 app.put('/api/vehicles/:id', async (req, res) => {
   try {
+    const current = await Vehicle.findOne({ id: req.params.id });
+    if (!current) return res.status(404).json({ success: false, message: 'Vehicle not found.' });
+    if (req.body.status === 'Sold' && current.status !== 'Sold') {
+      return res.status(409).json({
+        success: false,
+        message: 'Scooters can only be marked sold through the transactional customer-sales endpoint.'
+      });
+    }
+    if (current.status === 'Sold' && req.body.status && req.body.status !== 'Sold' &&
+        await Sale.exists({ vehicleId: current.id })) {
+      return res.status(409).json({
+        success: false,
+        message: 'A scooter with a completed sale cannot be returned to available stock.'
+      });
+    }
     const updated = await Vehicle.findOneAndUpdate({ id: req.params.id }, req.body, { new: true });
     io.emit('db_update', { collection: 'vehicles', action: 'update', data: updated });
     await broadcastFullSync();
@@ -643,7 +861,7 @@ app.post('/api/inventory-batches/:id/add-units', async (req, res) => {
 // CUSTOMERS
 // ==========================================
 app.get('/api/customers', async (req, res) => {
-  const customers = await Customer.find().sort({ createdAt: -1 });
+  const customers = await Customer.find({ archivedAt: null }).sort({ createdAt: -1 });
   res.json(customers);
 });
 
@@ -670,7 +888,39 @@ app.post('/api/customers', async (req, res) => {
 
 app.put('/api/customers/:id', async (req, res) => {
   try {
-    const updated = await Customer.findOneAndUpdate({ id: req.params.id }, req.body, { new: true });
+    const updates = {};
+    for (const field of ['name', 'phone', 'email', 'address', 'currentAddress', 'permanentAddress', 'city', 'pincode', 'panNumber', 'notes']) {
+      if (req.body[field] !== undefined) updates[field] = req.body[field];
+    }
+    if (updates.phone !== undefined) {
+      const phone = String(updates.phone).replace(/\D/g, '').replace(/^91(?=\d{10}$)/, '');
+      if (!/^[6-9]\d{9}$/.test(phone)) {
+        return res.status(400).json({ success: false, message: 'Enter a valid Indian mobile number.' });
+      }
+      updates.phone = phone;
+    }
+    if (updates.panNumber !== undefined) {
+      updates.panNumber = String(updates.panNumber).trim().toUpperCase();
+      if (updates.panNumber && !/^[A-Z]{5}\d{4}[A-Z]$/.test(updates.panNumber)) {
+        return res.status(400).json({ success: false, message: 'Enter a valid PAN number.' });
+      }
+    }
+    if (updates.currentAddress !== undefined) updates.address = updates.currentAddress;
+    const updated = await Customer.findOneAndUpdate(
+      { id: req.params.id, archivedAt: null },
+      updates,
+      { new: true, runValidators: true }
+    );
+    if (!updated) return res.status(404).json({ success: false, message: 'Customer not found.' });
+    await AuditLog.create({
+      id: `aud-${crypto.randomUUID()}`,
+      timestamp: new Date().toISOString(),
+      userName: process.env.ADMIN_NAME || 'Administrator',
+      userRole: 'Owner',
+      action: 'UPDATE_CUSTOMER',
+      module: 'Customers',
+      details: `Updated customer profile ${updated.customerCode}.`
+    });
     io.emit('db_update', { collection: 'customers', action: 'update', data: updated });
     await broadcastFullSync();
     res.json({ success: true, data: updated });
@@ -679,64 +929,442 @@ app.put('/api/customers/:id', async (req, res) => {
   }
 });
 
+app.delete('/api/customers/:id', async (req, res) => {
+  try {
+    const customer = await Customer.findOne({ id: req.params.id });
+    if (!customer) return res.status(404).json({ success: false, message: 'Customer not found.' });
+
+    const historyChecks = await Promise.all([
+      Sale.exists({ customerId: customer.id }),
+      ServiceRecord.exists({ customerId: customer.id }),
+      EMISchedule.exists({ customerId: customer.id }),
+      WarrantyInsurance.exists({ customerId: customer.id })
+    ]);
+    const hasHistory = historyChecks.some(Boolean);
+    if (!hasHistory) {
+      await Customer.deleteOne({ id: customer.id });
+      io.emit('db_update', { collection: 'customers', action: 'delete', data: { id: customer.id } });
+      await broadcastFullSync();
+      return res.json({ success: true, archived: false });
+    }
+
+    customer.archivedAt = new Date().toISOString();
+    await customer.save();
+    await AuditLog.create({
+      id: `aud-${crypto.randomUUID()}`,
+      timestamp: new Date().toISOString(),
+      userName: process.env.ADMIN_NAME || 'Administrator',
+      userRole: 'Owner',
+      action: 'ARCHIVE_CUSTOMER',
+      module: 'Customers',
+      details: `Archived customer ${customer.customerCode} while preserving financial history.`
+    });
+    io.emit('db_update', { collection: 'customers', action: 'update', data: customer });
+    await broadcastFullSync();
+    return res.json({ success: true, archived: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // ==========================================
 // SALES & BILLING
 // ==========================================
+app.post('/api/customer-sales', async (req, res) => {
+  const { customer: customerData, sale: saleData } = req.body || {};
+  const existingCustomerId = saleData?.customerId;
+  const phoneDigits = String(customerData?.phone || '').replace(/\D/g, '');
+  const normalizedPhone = phoneDigits.length === 12 && phoneDigits.startsWith('91')
+    ? phoneDigits.slice(2)
+    : phoneDigits;
+  const panNumber = String(customerData?.panNumber || '').trim().toUpperCase();
+  const paymentMethod = saleData?.paymentMethod ||
+    (saleData?.financingType === 'FinanceCompany' ? 'Finance Company EMI' :
+      saleData?.financingType === 'ShowroomDirect' ? 'Showroom Installments' : 'Full Payment');
+  const allowedMethods = ['Full Payment', 'Finance Company EMI', 'Showroom Installments'];
+
+  if (!existingCustomerId && !customerData?.name?.trim()) {
+    return res.status(400).json({ success: false, message: 'Customer name is required.' });
+  }
+  if (customerData && ['currentAddress', 'permanentAddress', 'panNumber'].some(field =>
+    customerData[field] !== undefined && typeof customerData[field] !== 'string'
+  )) {
+    return res.status(400).json({ success: false, message: 'Customer address and PAN fields must be text.' });
+  }
+  if (!existingCustomerId && !/^[6-9]\d{9}$/.test(normalizedPhone)) {
+    return res.status(400).json({ success: false, message: 'Enter a valid Indian mobile number.' });
+  }
+  if (!existingCustomerId && panNumber && !/^[A-Z]{5}\d{4}[A-Z]$/.test(panNumber)) {
+    return res.status(400).json({ success: false, message: 'Enter a valid PAN number.' });
+  }
+  if (!existingCustomerId && customerData?.guarantorRequired && (
+    !customerData.guarantor?.name?.trim() ||
+    !/^[6-9]\d{9}$/.test(String(customerData.guarantor.phone || '').replace(/\D/g, '').replace(/^91(?=\d{10}$)/, '')) ||
+    !customerData.guarantor?.address?.trim()
+  )) {
+    return res.status(400).json({ success: false, message: 'Complete all required guarantor details.' });
+  }
+  if (!allowedMethods.includes(paymentMethod)) {
+    return res.status(400).json({ success: false, message: 'Select a valid payment method.' });
+  }
+  if (!saleData?.saleDate || !saleData.vehicleId) {
+    return res.status(400).json({ success: false, message: 'Sale date and scooter are required.' });
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(saleData.saleDate) ||
+      Number.isNaN(new Date(`${saleData.saleDate}T12:00:00`).getTime())) {
+    return res.status(400).json({ success: false, message: 'Enter a valid sale date.' });
+  }
+
+  let session;
+  let result;
+  try {
+    session = await mongoose.startSession();
+    await session.withTransaction(async () => {
+      const vehicle = await Vehicle.findOne({ id: saleData.vehicleId, status: 'Available' }).session(session);
+      if (!vehicle) {
+        const existing = await Vehicle.findOne({ id: saleData.vehicleId }).session(session);
+        throw new Error(existing ? 'This scooter is no longer available. Select another unit.' : 'Selected scooter was not found.');
+      }
+      if (await Sale.exists({ vehicleId: vehicle.id }).session(session)) {
+        throw new Error('A sale already exists for this scooter. Refresh the inventory before continuing.');
+      }
+
+      const customerId = existingCustomerId || `cust-${crypto.randomUUID()}`;
+      const saleId = `sale-${crypto.randomUUID()}`;
+      const invoiceNumber = `MS-${new Date().getFullYear()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+      const exShowroomPrice = Number(saleData.sellingPrice ?? saleData.exShowroomPrice);
+      const discount = Number(saleData.discount || 0);
+      const finalPrice = Number(saleData.finalSellingPrice ?? saleData.totalOnRoadPrice ?? (exShowroomPrice - discount));
+      const bookingAmount = Number(saleData.bookingAmount || 0);
+      const downPayment = Number(saleData.downPayment || 0);
+      const paidAtSale = bookingAmount + downPayment;
+      const remainingAmount = finalPrice - paidAtSale;
+      const financingType = saleData.financingType || (paymentMethod === 'Finance Company EMI'
+        ? 'FinanceCompany'
+        : paymentMethod === 'Showroom Installments' ? 'ShowroomDirect' : 'Cash/Self');
+      const expectedPaymentMethod = financingType === 'FinanceCompany'
+        ? 'Finance Company EMI'
+        : financingType === 'ShowroomDirect' ? 'Showroom Installments' : 'Full Payment';
+      if (!['Cash/Self', 'FinanceCompany', 'ShowroomDirect'].includes(financingType) ||
+          (saleData.paymentMethod && paymentMethod !== expectedPaymentMethod)) {
+        throw new Error('Payment method and financing terms do not match.');
+      }
+
+      if (!Number.isFinite(exShowroomPrice) || exShowroomPrice <= 0 ||
+          !Number.isFinite(discount) || discount < 0 || discount >= exShowroomPrice ||
+          !Number.isFinite(finalPrice) || finalPrice <= 0 ||
+          !Number.isFinite(bookingAmount) || bookingAmount < 0 ||
+          !Number.isFinite(downPayment) || downPayment < 0 || paidAtSale > finalPrice) {
+        throw new Error('Check selling price, discount, and down payment amounts.');
+      }
+      if (paymentMethod === 'Full Payment' && paidAtSale !== finalPrice) {
+        throw new Error('Full payment must be recorded as the full final selling price.');
+      }
+      if (paymentMethod !== 'Full Payment' && paidAtSale >= finalPrice) {
+        throw new Error('Down payment must be less than the final selling price for an installment purchase.');
+      }
+
+      const customerCount = customerData ? await Customer.countDocuments().session(session) : 0;
+      let customer;
+      if (customerData) {
+        customer = {
+          ...customerData,
+          id: customerId,
+          customerCode: `CUST-${1001 + customerCount}`,
+          phone: normalizedPhone,
+          panNumber,
+          address: customerData.currentAddress || customerData.address || '',
+          currentAddress: customerData.currentAddress || customerData.address || '',
+          permanentAddress: customerData.permanentAddress || '',
+          guarantorRequired: Boolean(customerData.guarantorRequired),
+          guarantor: customerData.guarantorRequired ? customerData.guarantor : { name: '', phone: '', address: '' },
+          vehicleIds: [vehicle.id],
+          archivedAt: null,
+          communicationPreference: 'WhatsApp'
+        };
+      } else {
+        customer = await Customer.findOne({ id: customerId, archivedAt: null }).session(session);
+        if (!customer) throw new Error('Customer not found. Refresh the customer list and try again.');
+        customer.vehicleIds = Array.from(new Set([...(customer.vehicleIds || []), vehicle.id]));
+      }
+
+      const installments = [];
+      const tenure = Number(saleData.installmentCount || saleData.emiTenureMonths || 0);
+      const interestRate = Number(saleData.interestRate ?? saleData.emiInterestRate ?? 0);
+      let monthlyAmount = 0;
+      let totalInstallments = 0;
+      let scheduledFirstDueDate = saleData.firstDueDate || '';
+      if (financingType !== 'Cash/Self') {
+        if (!Number.isInteger(tenure) || tenure < 1 || tenure > 120) {
+          throw new Error('Installment count must be between 1 and 120 months.');
+        }
+        const firstDueDate = scheduledFirstDueDate || (() => {
+          const nextDate = new Date(`${saleData.saleDate}T12:00:00`);
+          nextDate.setMonth(nextDate.getMonth() + 1);
+          return nextDate.toISOString().slice(0, 10);
+        })();
+        scheduledFirstDueDate = firstDueDate;
+        if (!firstDueDate || (financingType === 'FinanceCompany' && !saleData.financeCompanyName?.trim())) {
+          throw new Error('Finance company and first installment due date are required.');
+        }
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(firstDueDate) ||
+            new Date(`${firstDueDate}T12:00:00`) < new Date(`${saleData.saleDate}T12:00:00`)) {
+          throw new Error('First installment due date must be on or after the sale date.');
+        }
+        if (!Number.isFinite(interestRate) || interestRate < 0 || interestRate > 100) {
+          throw new Error('Interest rate must be between 0 and 100 percent.');
+        }
+        if (financingType === 'ShowroomDirect' &&
+            !['Monthly', 'Fortnightly', 'Weekly'].includes(saleData.paymentFrequency || 'Monthly')) {
+          throw new Error('Select a valid showroom payment frequency.');
+        }
+        if (financingType === 'FinanceCompany' &&
+            !['Pending', 'Approved', 'Rejected'].includes(saleData.financeStatus || 'Pending')) {
+          throw new Error('Select a valid finance status.');
+        }
+        const monthlyRate = interestRate / 1200;
+        monthlyAmount = monthlyRate > 0
+          ? Math.round((remainingAmount * monthlyRate * Math.pow(1 + monthlyRate, tenure)) /
+            (Math.pow(1 + monthlyRate, tenure) - 1))
+          : Math.ceil(remainingAmount / tenure);
+        const agreedAmounts = Array.isArray(saleData.installmentAmounts) &&
+          saleData.installmentAmounts.length === tenure
+          ? saleData.installmentAmounts.map(Number)
+          : Array.from({ length: tenure }, (_, index) =>
+            index === tenure - 1 ? remainingAmount - monthlyAmount * (tenure - 1) : monthlyAmount
+          );
+        if (agreedAmounts.some(amount => !Number.isFinite(amount) || amount <= 0)) {
+          throw new Error('Every installment amount must be a positive number.');
+        }
+        totalInstallments = agreedAmounts.reduce((sum, amount) => sum + amount, 0);
+        const firstDue = new Date(`${firstDueDate}T12:00:00`);
+        if (Number.isNaN(firstDue.getTime())) throw new Error('Enter a valid first installment due date.');
+        const frequency = financingType === 'ShowroomDirect'
+          ? (saleData.paymentFrequency || 'Monthly')
+          : 'Monthly';
+        for (let index = 0; index < tenure; index += 1) {
+          const dueDate = new Date(firstDue);
+          if (frequency === 'Weekly') {
+            dueDate.setDate(firstDue.getDate() + index * 7);
+          } else if (frequency === 'Fortnightly') {
+            dueDate.setDate(firstDue.getDate() + index * 14);
+          } else {
+            const targetMonth = firstDue.getMonth() + index;
+            const targetYear = firstDue.getFullYear() + Math.floor(targetMonth / 12);
+            const normalizedMonth = targetMonth % 12;
+            const paymentDay = Math.min(
+              Number(saleData.paymentDay) || firstDue.getDate(),
+              new Date(targetYear, normalizedMonth + 1, 0).getDate()
+            );
+            dueDate.setFullYear(targetYear, normalizedMonth, paymentDay);
+          }
+          const dueDateString = dueDate.toISOString().slice(0, 10);
+          installments.push({
+            installmentNo: index + 1,
+            dueDate: dueDateString,
+            amount: agreedAmounts[index],
+            paidAmount: 0,
+            status: 'Pending',
+            payments: []
+          });
+        }
+      }
+
+      const initialLedger = paidAtSale > 0 ? [{
+        amountDue: finalPrice,
+        amountPaid: paidAtSale,
+        paymentDate: saleData.saleDate,
+        paymentMethod: saleData.initialPaymentMethod || 'Cash',
+        reference: saleData.initialPaymentReference || '',
+        outstandingBalance: remainingAmount
+      }] : [];
+      const sale = {
+        id: saleId,
+        invoiceNumber,
+        customerId,
+        vehicleId: vehicle.id,
+        saleDate: saleData.saleDate,
+        exShowroomPrice,
+        discount,
+        gstAmount: Number(saleData.gstAmount || 0),
+        accessoriesAmount: Number(saleData.accessoriesAmount || 0),
+        insuranceAmount: Number(saleData.insuranceAmount || 0),
+        registrationAmount: Number(saleData.registrationAmount || 0),
+        totalOnRoadPrice: finalPrice,
+        finalSellingPrice: finalPrice,
+        bookingAmount,
+        downPayment,
+        financingType,
+        paymentMethod,
+        financeCompanyName: saleData.financeCompanyName || '',
+        loanAccountRef: saleData.loanAccountRef || '',
+        financedAmount: remainingAmount,
+        remainingAmount,
+        financeStatus: financingType === 'FinanceCompany' ? (saleData.financeStatus || 'Pending') : '',
+        firstDueDate: scheduledFirstDueDate,
+        paymentDay: saleData.paymentDay || null,
+        paymentFrequency: financingType === 'ShowroomDirect' ? (saleData.paymentFrequency || 'Monthly') : 'Monthly',
+        installmentSchedule: installments,
+        paymentLedger: initialLedger,
+        modelNumber: vehicle.modelNumber || vehicle.model,
+        companyName: vehicle.companyName || vehicle.brand,
+        chassisVin: vehicle.chassisVin,
+        batterySerial: vehicle.batterySerial,
+        purchaseCostSnapshot: vehicle.purchasePrice || 0,
+        pendingDocuments: [],
+        deliveryStatus: saleData.deliveryStatus || 'Handed Over',
+        deliveryDate: saleData.deliveryDate || saleData.saleDate,
+        registrationNumber: saleData.registrationNumber || '',
+        insurancePolicyNumber: saleData.insurancePolicyNumber || '',
+        salespersonName: process.env.ADMIN_NAME || 'Deen Dayak Tiwari',
+        deliveryChecklist: saleData.deliveryChecklist || {},
+        handoverNotes: saleData.handoverNotes || '',
+        createdAt: new Date().toISOString()
+      };
+
+      if (customerData) {
+        await Customer.create([customer], { session });
+      } else {
+        await customer.save({ session });
+      }
+      await Sale.create([sale], { session });
+      const soldVehicle = await Vehicle.findOneAndUpdate(
+        { id: vehicle.id, status: 'Available' },
+        { $set: { status: 'Sold', assignedCustomerId: customerId } },
+        { new: true, session }
+      );
+      if (!soldVehicle) throw new Error('This scooter was just sold. Select another available unit.');
+
+      if (vehicle.inventoryBatchId) {
+        const batch = await InventoryBatch.findOne({ id: vehicle.inventoryBatchId }).session(session);
+        if (!batch) throw new Error('Inventory batch could not be found. No changes were saved.');
+        const remainingUnits = await Vehicle.countDocuments({
+          inventoryBatchId: vehicle.inventoryBatchId,
+          status: 'Available'
+        }).session(session);
+        batch.availableQty = remainingUnits;
+        batch.soldQty = (batch.soldQty || 0) + 1;
+        if (remainingUnits === 0) batch.status = 'Out of Stock';
+        await batch.save({ session });
+      }
+
+      if (financingType !== 'Cash/Self') {
+        await EMISchedule.create([{
+          id: `emi-${crypto.randomUUID()}`,
+          saleId,
+          customerId,
+          vehicleId: vehicle.id,
+          financeType: financingType,
+          financeCompanyName: sale.financeCompanyName || 'Showroom Installments',
+          loanAccountNo: sale.loanAccountRef,
+          totalFinancedAmount: remainingAmount,
+          tenureMonths: tenure,
+          monthlyEmiAmount: monthlyAmount,
+          interestRateAnnual: interestRate,
+          installments: installments.map(item => ({
+            ...item,
+            payments: [],
+            outstandingBalance: item.amount
+          })),
+          outstandingBalance: totalInstallments,
+          totalPaidAmount: 0,
+          createdAt: new Date().toISOString()
+        }], { session });
+      }
+
+      const warrantyEndDate = new Date(`${saleData.saleDate}T12:00:00`);
+      warrantyEndDate.setMonth(warrantyEndDate.getMonth() + (vehicle.vehicleWarrantyMonths || 36));
+      await WarrantyInsurance.create([{
+        id: `warranty-${crypto.randomUUID()}`,
+        vehicleId: vehicle.id,
+        vehicleModel: `${vehicle.brand} ${vehicle.model}`,
+        chassisVin: vehicle.chassisVin,
+        customerId,
+        customerName: customer.name,
+        policyType: 'Vehicle Warranty',
+        providerName: vehicle.companyName || vehicle.brand,
+        policyNumber: `WAR-${invoiceNumber}`,
+        startDate: saleData.saleDate,
+        endDate: warrantyEndDate.toISOString().slice(0, 10),
+        status: 'Active',
+        coverageNotes: `${vehicle.vehicleWarrantyMonths || 36}-month vehicle warranty; battery serial ${vehicle.batterySerial || 'not recorded'}.`,
+        claimHistory: []
+      }], { session });
+
+      const saleDate = new Date(`${saleData.saleDate}T12:00:00`);
+      const serviceDueDays = [60, 180, 365];
+      const serviceKm = [1000, 5000, 10000];
+      const services = serviceDueDays.map((days, index) => {
+        const dueDate = new Date(saleDate);
+        dueDate.setDate(dueDate.getDate() + days);
+        const date = dueDate.toISOString().slice(0, 10);
+        return {
+          id: `srv-${crypto.randomUUID()}`,
+          serviceNumber: index + 1,
+          jobCardNumber: `JC-${crypto.randomBytes(4).toString('hex').toUpperCase()}`,
+          customerId,
+          vehicleId: vehicle.id,
+          isFree: true,
+          status: 'Upcoming',
+          scheduledDate: date,
+          dueDate: date,
+          dueKm: serviceKm[index],
+          customerComplaints: `Free service ${index + 1}: scheduled maintenance and EV inspection.`,
+          inspectionChecklist: {},
+          partsReplaced: [],
+          labourCharge: 0,
+          partsCharge: 0,
+          taxAmount: 0,
+          totalCustomerPayable: 0,
+          createdAt: new Date().toISOString()
+        };
+      });
+      await ServiceRecord.insertMany(services, { session });
+
+      await AuditLog.create([{
+        id: `aud-${crypto.randomUUID()}`,
+        timestamp: new Date().toISOString(),
+        userName: process.env.ADMIN_NAME || 'Deen Dayak Tiwari',
+        userRole: 'Owner',
+        action: 'RECORD_CUSTOMER_SALE',
+        module: 'Sales',
+        details: `Recorded invoice ${invoiceNumber} for ${vehicle.modelNumber || vehicle.model}; original unit cost retained.`
+      }], { session });
+      result = { customer, sale, vehicle: soldVehicle };
+    });
+  } catch (err) {
+    const message = err.message || 'Unable to complete sale.';
+    const status = /unavailable|sold|inventory quantity changed/i.test(message) ? 409 : 400;
+    return res.status(status).json({ success: false, message });
+  } finally {
+    if (session) await session.endSession();
+  }
+
+  io.emit('db_update', { collection: 'sales', action: 'create', data: result.sale });
+  await broadcastFullSync();
+  return res.status(201).json({ success: true, data: result });
+});
+
 app.get('/api/sales', async (req, res) => {
   const sales = await Sale.find().sort({ createdAt: -1 });
   res.json(sales);
 });
 
 app.post('/api/sales', async (req, res) => {
-  try {
-    const saleData = req.body;
-    const sale = new Sale(saleData);
-    await sale.save();
-
-    // Mark Vehicle as Sold
-    await Vehicle.findOneAndUpdate(
-      { id: saleData.vehicleId },
-      { status: 'Sold', assignedCustomerId: saleData.customerId }
-    );
-
-    // Link vehicle to Customer
-    await Customer.findOneAndUpdate(
-      { id: saleData.customerId },
-      { $addToSet: { vehicleIds: saleData.vehicleId } }
-    );
-
-    // If EMI schedule provided, create it
-    if (saleData.emiSchedule) {
-      const emi = new EMISchedule(saleData.emiSchedule);
-      await emi.save();
-    }
-
-    // Auto-create service records if provided
-    if (saleData.services && Array.isArray(saleData.services)) {
-      await ServiceRecord.insertMany(saleData.services);
-    }
-
-    // Auto-create initial reminder (WhatsApp only)
-    if (saleData.reminder) {
-      const rem = new Reminder({
-        ...saleData.reminder,
-        channels: ['WhatsApp'],
-        lastSentVia: 'WhatsApp'
-      });
-      await rem.save();
-    }
-
-    io.emit('db_update', { collection: 'sales', action: 'create', data: sale });
-    await broadcastFullSync();
-    res.status(201).json({ success: true, data: sale });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
+  return res.status(410).json({
+    success: false,
+    message: 'Direct sale creation is disabled. Use /api/customer-sales to validate stock and save the sale transactionally.'
+  });
 });
 
 app.put('/api/sales/:id', async (req, res) => {
   try {
-    const updated = await Sale.findOneAndUpdate({ id: req.params.id }, req.body, { new: true });
+    const updates = {};
+    for (const field of ['deliveryStatus', 'deliveryDate', 'registrationNumber', 'deliveryChecklist', 'uploadedInvoiceFile', 'handoverNotes']) {
+      if (req.body[field] !== undefined) updates[field] = req.body[field];
+    }
+    const updated = await Sale.findOneAndUpdate({ id: req.params.id }, updates, { new: true });
+    if (!updated) return res.status(404).json({ success: false, message: 'Sale not found.' });
     io.emit('db_update', { collection: 'sales', action: 'update', data: updated });
     await broadcastFullSync();
     res.json({ success: true, data: updated });
@@ -748,9 +1376,97 @@ app.put('/api/sales/:id', async (req, res) => {
 // ==========================================
 // SERVICES & JOB CARDS
 // ==========================================
+async function ensureFreeServiceMilestones() {
+  const soldVehicles = await Vehicle.find({
+    status: 'Sold'
+  }).select('id assignedCustomerId model modelNumber');
+  if (!soldVehicles.length) return;
+
+  const vehicleIds = soldVehicles.map(vehicle => vehicle.id);
+  const [sales, existingServices] = await Promise.all([
+    Sale.find({ vehicleId: { $in: vehicleIds } }).select('vehicleId customerId saleDate deliveryDate'),
+    ServiceRecord.find({ vehicleId: { $in: vehicleIds }, isFree: true }).select('vehicleId serviceNumber')
+  ]);
+  const saleByVehicle = new Map(sales.map(sale => [sale.vehicleId, sale]));
+  const existingMilestones = new Set(existingServices.map(service =>
+    `${service.vehicleId}:${service.serviceNumber}`
+  ));
+  const milestoneDays = [60, 180, 365];
+  const milestoneKm = [1000, 5000, 10000];
+  const records = [];
+
+  for (const vehicle of soldVehicles) {
+    const sale = saleByVehicle.get(vehicle.id);
+    const customerId = sale?.customerId || vehicle.assignedCustomerId;
+    if (!customerId) continue;
+    const startDate = sale?.deliveryDate || sale?.saleDate || new Date().toISOString().slice(0, 10);
+    for (let index = 0; index < milestoneDays.length; index += 1) {
+      const serviceNumber = index + 1;
+      if (existingMilestones.has(`${vehicle.id}:${serviceNumber}`)) continue;
+      const dueDate = new Date(`${startDate}T12:00:00`);
+      dueDate.setDate(dueDate.getDate() + milestoneDays[index]);
+      const dateString = dueDate.toISOString().slice(0, 10);
+      records.push({
+        id: `auto-free-${vehicle.id}-${serviceNumber}`,
+        serviceNumber,
+        jobCardNumber: `JC-AUTO-${vehicle.id}-${serviceNumber}`,
+        customerId,
+        vehicleId: vehicle.id,
+        isFree: true,
+        status: 'Upcoming',
+        scheduledDate: dateString,
+        dueDate: dateString,
+        dueKm: milestoneKm[index],
+        customerComplaints: `Free service ${serviceNumber}: scheduled maintenance and EV inspection.`,
+        inspectionChecklist: {},
+        partsReplaced: [],
+        labourCharge: 0,
+        partsCharge: 0,
+        taxAmount: 0,
+        totalCustomerPayable: 0,
+        createdAt: new Date().toISOString()
+      });
+      existingMilestones.add(`${vehicle.id}:${serviceNumber}`);
+    }
+  }
+
+  if (records.length) {
+    try {
+      await ServiceRecord.insertMany(records, { ordered: false });
+    } catch (error) {
+      if (error.code !== 11000 && error.writeErrors?.some(writeError => writeError.code !== 11000)) {
+        throw error;
+      }
+      const persisted = await ServiceRecord.find({
+        vehicleId: { $in: vehicleIds },
+        isFree: true,
+        serviceNumber: { $in: [1, 2, 3] }
+      }).select('vehicleId serviceNumber');
+      const persistedKeys = new Set(persisted.map(service => `${service.vehicleId}:${service.serviceNumber}`));
+      if (records.some(record => !persistedKeys.has(`${record.vehicleId}:${record.serviceNumber}`))) {
+        throw error;
+      }
+    }
+    await AuditLog.create({
+      id: `aud-${crypto.randomUUID()}`,
+      timestamp: new Date().toISOString(),
+      userName: process.env.ADMIN_NAME || 'Administrator',
+      userRole: 'Owner',
+      action: 'CREATE_MISSING_FREE_SERVICE_MILESTONES',
+      module: 'Service',
+      details: `Created ${records.length} missing free-service milestone record(s) for sold scooters.`
+    });
+  }
+}
+
 app.get('/api/services', async (req, res) => {
-  const services = await ServiceRecord.find().sort({ createdAt: -1 });
-  res.json(services);
+  try {
+    await ensureFreeServiceMilestones();
+    const services = await ServiceRecord.find().sort({ dueDate: 1, createdAt: -1 });
+    res.json(services);
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
 
 app.post('/api/services', async (req, res) => {
@@ -767,12 +1483,76 @@ app.post('/api/services', async (req, res) => {
 
 app.put('/api/services/:id', async (req, res) => {
   try {
-    const updated = await ServiceRecord.findOneAndUpdate({ id: req.params.id }, req.body, { new: true });
+    const updates = {};
+    for (const field of ['dueDate', 'scheduledDate', 'dueKm', 'customerComplaints']) {
+      if (req.body[field] !== undefined) updates[field] = req.body[field];
+    }
+    if (updates.dueDate !== undefined &&
+        (!/^\d{4}-\d{2}-\d{2}$/.test(String(updates.dueDate)) ||
+         Number.isNaN(new Date(`${updates.dueDate}T12:00:00`).getTime()))) {
+      return res.status(400).json({ success: false, message: 'Enter a valid service due date.' });
+    }
+    if (updates.scheduledDate === undefined && updates.dueDate !== undefined) {
+      updates.scheduledDate = updates.dueDate;
+    }
+    if (updates.dueKm !== undefined &&
+        (!Number.isFinite(Number(updates.dueKm)) || Number(updates.dueKm) < 0)) {
+      return res.status(400).json({ success: false, message: 'Service kilometre interval must be non-negative.' });
+    }
+    if (updates.customerComplaints !== undefined &&
+        (typeof updates.customerComplaints !== 'string' || updates.customerComplaints.length > 1000)) {
+      return res.status(400).json({ success: false, message: 'Service notes must be text with at most 1000 characters.' });
+    }
+    const updated = await ServiceRecord.findOneAndUpdate(
+      { id: req.params.id, status: { $ne: 'Completed' } },
+      updates,
+      { new: true, runValidators: true }
+    );
+    if (!updated) return res.status(404).json({ success: false, message: 'Editable service record not found.' });
+    await AuditLog.create({
+      id: `aud-${crypto.randomUUID()}`,
+      timestamp: new Date().toISOString(),
+      userName: process.env.ADMIN_NAME || 'Administrator',
+      userRole: 'Owner',
+      action: 'EDIT_SERVICE',
+      module: 'Service',
+      details: `Updated service record ${updated.jobCardNumber}.`
+    });
     io.emit('db_update', { collection: 'services', action: 'update', data: updated });
     await broadcastFullSync();
     res.json({ success: true, data: updated });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.patch('/api/services/:id/mark-done', async (req, res) => {
+  try {
+    const completedDate = new Date().toISOString().slice(0, 10);
+    const updated = await ServiceRecord.findOneAndUpdate(
+      { id: req.params.id, status: { $ne: 'Completed' } },
+      { $set: { status: 'Completed', completedDate } },
+      { new: true, runValidators: true }
+    );
+    if (!updated) {
+      const existing = await ServiceRecord.findOne({ id: req.params.id });
+      if (!existing) return res.status(404).json({ success: false, message: 'Service record not found.' });
+      return res.json({ success: true, data: existing });
+    }
+    await AuditLog.create({
+      id: `aud-${crypto.randomUUID()}`,
+      timestamp: new Date().toISOString(),
+      userName: process.env.ADMIN_NAME || 'Administrator',
+      userRole: 'Owner',
+      action: 'MARK_SERVICE_DONE',
+      module: 'Service',
+      details: `Marked service ${updated.jobCardNumber} completed.`
+    });
+    io.emit('db_update', { collection: 'services', action: 'update', data: updated });
+    await broadcastFullSync();
+    return res.json({ success: true, data: updated });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 
@@ -785,37 +1565,98 @@ app.get('/api/emi', async (req, res) => {
 });
 
 app.post('/api/emi/payment', async (req, res) => {
+  const { emiScheduleId, installmentNo, paidAmount, paymentMethod, notes } = req.body;
+  const allowedMethods = ['Cash', 'UPI', 'Bank Transfer', 'Cheque'];
+  const amount = Number(paidAmount);
+  if (!emiScheduleId || !Number.isInteger(Number(installmentNo)) || !Number.isFinite(amount) || amount <= 0 ||
+      !allowedMethods.includes(paymentMethod)) {
+    return res.status(400).json({ success: false, message: 'Enter a valid installment, amount, and payment method.' });
+  }
+
+  const session = await mongoose.startSession();
+  let emi;
+  let saleRecord;
+  let receiptNumber;
   try {
-    const { emiScheduleId, installmentNo, paidAmount, paymentMethod, notes } = req.body;
-    const emi = await EMISchedule.findOne({ id: emiScheduleId });
-    if (!emi) return res.status(404).json({ success: false, message: 'EMI Schedule not found' });
+    await session.withTransaction(async () => {
+      emi = await EMISchedule.findOne({ id: emiScheduleId }).session(session);
+      if (!emi) throw new Error('EMI schedule not found.');
+      const installment = emi.installments.find(item => item.installmentNo === Number(installmentNo));
+      if (!installment) throw new Error('Installment not found.');
+      const amountDue = Number(installment.amount) - Number(installment.paidAmount || 0);
+      if (amount > amountDue) throw new Error(`Payment cannot exceed the remaining installment amount of ₹${amountDue}.`);
 
-    const receiptNumber = `RCPT-EMI-${Date.now().toString().slice(-6)}`;
-    const today = new Date().toISOString().slice(0, 10);
+      receiptNumber = `RCPT-EMI-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+      const paymentDate = new Date().toISOString().slice(0, 10);
+      const newPaid = Number(installment.paidAmount || 0) + amount;
+      const nextStatus = newPaid >= Number(installment.amount)
+        ? 'Paid'
+        : installment.dueDate < paymentDate ? 'Overdue' : 'Partially Paid';
+      installment.paidAmount = newPaid;
+      installment.paidDate = paymentDate;
+      installment.status = nextStatus;
+      installment.receiptNumber = receiptNumber;
+      installment.paymentMethod = paymentMethod;
+      installment.notes = notes || installment.notes;
+      installment.outstandingBalance = Math.max(0, Number(installment.amount) - newPaid);
+      installment.payments = [
+        ...(installment.payments || []),
+        { amount, paymentDate, paymentMethod, reference: notes || '', receiptNumber }
+      ];
+      emi.totalPaidAmount = Number(emi.totalPaidAmount || 0) + amount;
+      emi.outstandingBalance = emi.installments.reduce((sum, item) =>
+        sum + Math.max(0, Number(item.amount) - Number(item.paidAmount || 0)), 0
+      );
+      emi.markModified('installments');
+      await emi.save({ session });
 
-    emi.installments = emi.installments.map(inst => {
-      if (inst.installmentNo !== installmentNo) return inst;
-      const newPaid = (inst.paidAmount || 0) + paidAmount;
-      return {
-        ...inst,
-        paidAmount: newPaid,
-        paidDate: today,
-        status: newPaid >= inst.amount ? 'Paid' : 'Partially Paid',
-        receiptNumber,
-        paymentMethod,
-        notes: notes || inst.notes
-      };
+      saleRecord = await Sale.findOne({ id: emi.saleId }).session(session);
+      if (!saleRecord) throw new Error('Sale associated with this installment schedule was not found.');
+      let remainingSaleBalance = Math.max(0, Number(saleRecord.remainingAmount) || 0);
+      if (!saleRecord.paymentMethod && remainingSaleBalance === 0) {
+        remainingSaleBalance = Math.max(0, Number(saleRecord.totalOnRoadPrice) -
+          Number(saleRecord.bookingAmount || 0) - Number(saleRecord.downPayment || 0));
+      }
+      if (!saleRecord.paymentMethod) {
+        saleRecord.paymentMethod = emi.financeType === 'FinanceCompany'
+          ? 'Finance Company EMI'
+          : 'Showroom Installments';
+      }
+      saleRecord.remainingAmount = Math.max(0, remainingSaleBalance - amount);
+      saleRecord.paymentLedger = [
+        ...(saleRecord.paymentLedger || []),
+        {
+          amountDue: Number(installment.amount),
+          amountPaid: amount,
+          paymentDate,
+          paymentMethod,
+          reference: notes || '',
+          outstandingBalance: saleRecord.remainingAmount
+        }
+      ];
+      saleRecord.markModified('paymentLedger');
+      await saleRecord.save({ session });
+
+      await AuditLog.create([{
+        id: `aud-${crypto.randomUUID()}`,
+        timestamp: new Date().toISOString(),
+        userName: process.env.ADMIN_NAME || 'Administrator',
+        userRole: 'Owner',
+        action: 'COLLECT_EMI_PAYMENT',
+        module: 'EMI & Payments',
+        details: `Recorded receipt ${receiptNumber} for installment #${installmentNo}.`
+      }], { session });
     });
 
-    emi.totalPaidAmount = (emi.totalPaidAmount || 0) + paidAmount;
-    emi.outstandingBalance = Math.max(0, emi.outstandingBalance - paidAmount);
-    await emi.save();
-
     io.emit('db_update', { collection: 'emiSchedules', action: 'update', data: emi });
+    io.emit('db_update', { collection: 'sales', action: 'update', data: saleRecord });
     await broadcastFullSync();
-    res.json({ success: true, receiptNumber, data: emi });
+    return res.json({ success: true, receiptNumber, data: emi });
   } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
+    const status = /not found/i.test(err.message) ? 404 : /cannot exceed/i.test(err.message) ? 400 : 500;
+    return res.status(status).json({ success: false, message: err.message });
+  } finally {
+    await session.endSession();
   }
 });
 
@@ -1096,6 +1937,25 @@ app.post('/api/wipe-clean', async (req, res) => {
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
+});
+
+app.use('/api', (req, res) => {
+  return res.status(404).json({
+    success: false,
+    message: `API route not found: ${req.method} ${req.originalUrl}`
+  });
+});
+
+app.use('/api', (error, req, res, next) => {
+  if (res.headersSent) return next(error);
+  const status = Number.isInteger(error.status) && error.status >= 400 && error.status < 600
+    ? error.status
+    : 500;
+  console.error(`[API] ${req.method} ${req.originalUrl} failed:`, error.message || 'Unknown error');
+  return res.status(status).json({
+    success: false,
+    message: status >= 500 ? 'The server could not complete this request. Check the backend logs.' : error.message
+  });
 });
 
 // START SERVER
