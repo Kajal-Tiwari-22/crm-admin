@@ -21,9 +21,8 @@ function createSessionCookie() {
   const payload = `admin:${expiresAt}`;
   const value = `${payload}.${sign(payload)}`;
   const isProduction = process.env.NODE_ENV === 'production';
-  const sameSite = isProduction ? 'None' : 'Lax';
   const secure = isProduction ? '; Secure' : '';
-  return `${COOKIE_NAME}=${value}; HttpOnly; SameSite=${sameSite}; Path=/; Max-Age=${SESSION_TTL_SECONDS}${secure}`;
+  return `${COOKIE_NAME}=${value}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_TTL_SECONDS}${secure}`;
 }
 
 function createSocketToken() {
@@ -34,9 +33,8 @@ function createSocketToken() {
 
 function clearSessionCookie() {
   const isProduction = process.env.NODE_ENV === 'production';
-  const sameSite = isProduction ? 'None' : 'Lax';
   const secure = isProduction ? '; Secure' : '';
-  return `${COOKIE_NAME}=; HttpOnly; SameSite=${sameSite}; Path=/; Max-Age=0${secure}`;
+  return `${COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secure}`;
 }
 
 function readCookie(cookieHeader, name) {
