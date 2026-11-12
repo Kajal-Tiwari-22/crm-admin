@@ -17,13 +17,14 @@ const { sendWhatsAppReminder } = require('./services/whatsapp');
 const seedData = require('./data/seedData.cjs');
 const { authenticateAdmin, clearSessionCookie, createSessionCookie, isValidSession } = require('./services/auth');
 
-const FRONTEND_ORIGIN = new URL(
-  process.env.FRONTEND_ORIGIN || (
+const FRONTEND_ORIGINS = new Set([
+  ...(process.env.FRONTEND_ORIGIN || (
     process.env.NODE_ENV === 'production'
       ? 'https://crm-admin-jbo8.vercel.app'
       : 'http://localhost:3000'
-  )
-).origin;
+  )).split(',').map(origin => new URL(origin.trim()).origin),
+  'https://crm-admin-jbo8.vercel.app'
+]);
 
 function getAuthConfigurationIssues() {
   const issues = [];
@@ -50,7 +51,7 @@ const server = http.createServer(app);
 // Configure Socket.io with wide CORS for local dev & production
 const io = new Server(server, {
   cors: {
-    origin: FRONTEND_ORIGIN,
+    origin: [...FRONTEND_ORIGINS],
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH']
   }
@@ -68,7 +69,9 @@ io.use((socket, next) => {
 
 // Middleware
 app.use(cors({
-  origin: FRONTEND_ORIGIN,
+  origin: (origin, callback) => {
+    callback(null, !origin || FRONTEND_ORIGINS.has(origin));
+  },
   credentials: true
 }));
 app.use(express.json({ limit: '50mb' }));
@@ -212,8 +215,7 @@ app.get('/api/health', (req, res) => {
 app.use('/api', (req, res, next) => {
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
     const origin = req.get('origin');
-    const expectedOrigin = FRONTEND_ORIGIN;
-    if (origin && origin !== expectedOrigin) {
+    if (origin && !FRONTEND_ORIGINS.has(origin)) {
       return res.status(403).json({ success: false, message: 'Request origin is not allowed.' });
     }
   }
