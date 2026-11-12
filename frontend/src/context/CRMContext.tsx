@@ -200,7 +200,7 @@ interface CRMContextType {
 }
 
 const CRMContext = createContext<CRMContextType | undefined>(undefined);
-const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000';
+const API_BASE = '/api';
 
 export function CRMProvider({ children }: { children: ReactNode }) {
   const [db, setDb] = useState<CRMDatabase | null>(null);
@@ -239,7 +239,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
 
   const loginAdmin = async (email: string, pass: string): Promise<{ success: boolean; message?: string }> => {
     try {
-      const response = await fetch(`${BACKEND}/api/auth/login`, {
+      const response = await fetch(`${API_BASE}/auth/login`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
@@ -258,7 +258,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
   };
 
   const logoutAdmin = () => {
-    fetch(`${BACKEND}/api/auth/logout`, { method: 'POST', credentials: 'include' })
+    fetch(`${API_BASE}/auth/logout`, { method: 'POST', credentials: 'include' })
       .catch(error => console.error('[Auth] Sign-out request failed:', error));
     getMongoSocket().disconnect();
     setIsAuthenticated(false);
@@ -278,7 +278,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
   // Restore the server-side session before loading any CRM records.
   useEffect(() => {
     let mounted = true;
-    fetch(`${BACKEND}/api/auth/session`, { credentials: 'include' })
+    fetch(`${API_BASE}/auth/session`, { credentials: 'include' })
       .then(async response => {
         if (!response.ok) throw new Error('No active admin session.');
         return response.json();
@@ -479,8 +479,6 @@ export function CRMProvider({ children }: { children: ReactNode }) {
   };
 
   // 1b. Inventory Batch Actions — direct API calls to backend
-  const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000';
-
   const addInventoryBatch = async (batchData: {
     modelNumber: string; lightType: string; companyName: string;
     batteryCompanyName: string; hsnCode: string; purchaseDate: string;
@@ -489,7 +487,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
     units: InventoryUnit[];
   }): Promise<{ success: boolean; message?: string; data?: InventoryBatch }> => {
     try {
-      const res = await fetch(`${BACKEND}/api/inventory-batches`, {
+      const res = await fetch(`${API_BASE}/inventory-batches`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
@@ -508,7 +506,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
 
   const updateInventoryBatch = async (id: string, updates: Partial<InventoryBatch>): Promise<{ success: boolean; message?: string }> => {
     try {
-      const res = await fetch(`${BACKEND}/api/inventory-batches/${id}`, {
+      const res = await fetch(`${API_BASE}/inventory-batches/${id}`, {
         method: 'PUT',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
@@ -523,7 +521,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
 
   const deleteInventoryBatch = async (id: string): Promise<{ success: boolean; message?: string; archived?: boolean }> => {
     try {
-      const res = await fetch(`${BACKEND}/api/inventory-batches/${id}`, { method: 'DELETE', credentials: 'include' });
+      const res = await fetch(`${API_BASE}/inventory-batches/${id}`, { method: 'DELETE', credentials: 'include' });
       const json = await res.json();
       return { success: json.success, message: json.message, archived: json.archived };
     } catch (err: any) {
@@ -533,7 +531,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
 
   const addUnitsToInventoryBatch = async (batchId: string, units: InventoryUnit[]): Promise<{ success: boolean; message?: string }> => {
     try {
-      const res = await fetch(`${BACKEND}/api/inventory-batches/${batchId}/add-units`, {
+      const res = await fetch(`${API_BASE}/inventory-batches/${batchId}/add-units`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
@@ -648,7 +646,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
             ? 'Showroom Installments'
             : 'Full Payment';
         const isFullPayment = params.financingType === 'Cash/Self';
-        const response = await fetch(`${BACKEND}/api/customer-sales`, {
+        const response = await fetch(`${API_BASE}/customer-sales`, {
           method: 'POST',
           credentials: 'include',
           headers: { 'Content-Type': 'application/json' },
@@ -1105,7 +1103,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
     notes?: string;
   }) => {
     try {
-      const response = await fetch(`${BACKEND}/api/emi/payment`, {
+      const response = await fetch(`${API_BASE}/emi/payment`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },

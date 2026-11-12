@@ -25,7 +25,7 @@ import {
   ShieldCheck
 } from 'lucide-react';
 
-const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000';
+const API_BASE = '/api';
 
 export default function CustomersView() {
   const {
@@ -95,7 +95,7 @@ export default function CustomersView() {
     if (!editingCustomer) return;
     setActionError('');
     try {
-      const response = await fetch(`${BACKEND}/api/customers/${editingCustomer.id}`, {
+      const response = await fetch(`${API_BASE}/customers/${editingCustomer.id}`, {
         method: 'PUT',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
@@ -118,7 +118,7 @@ export default function CustomersView() {
     if (!window.confirm(`Archive ${customer.name}? Financial and service history will be preserved.`)) return;
     setActionError('');
     try {
-      const response = await fetch(`${BACKEND}/api/customers/${customer.id}`, { method: 'DELETE', credentials: 'include' });
+      const response = await fetch(`${API_BASE}/customers/${customer.id}`, { method: 'DELETE', credentials: 'include' });
       const result = await response.json();
       if (!response.ok || !result.success) throw new Error(result.message || 'Could not archive customer.');
       await syncFromMongoDB();

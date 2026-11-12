@@ -5,7 +5,7 @@ import { AlertCircle, Bike, LoaderCircle, X } from 'lucide-react';
 import { useCRM } from '@/context/CRMContext';
 import { formatCurrency } from '@/lib/storage';
 
-const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000';
+const API_BASE = '/api';
 const inputClass = 'w-full min-w-0 rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-800 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100 disabled:bg-slate-100';
 
 type PaymentMethod = 'Full Payment' | 'Finance Company EMI' | 'Showroom Installments';
@@ -44,7 +44,7 @@ async function readApiResponse<T>(response: Response, action: string): Promise<T
     const preview = body.trim().slice(0, 120).replace(/\s+/g, ' ');
     throw new Error(
       `${action} returned a non-JSON response (HTTP ${response.status}). ` +
-      `Check that NEXT_PUBLIC_BACKEND_URL points to the CRM backend, not the frontend. ` +
+      `Check that the frontend /api rewrite points to the CRM backend. ` +
       `Response: ${preview || 'empty response'}`
     );
   }
@@ -118,7 +118,7 @@ export default function CustomerSaleForm({ onClose, onSaved }: { onClose: () => 
   useEffect(() => {
     let active = true;
     setLoadingStock(true);
-    fetch(`${BACKEND}/api/available-scooters`, { credentials: 'include' })
+    fetch(`${API_BASE}/available-scooters`, { credentials: 'include' })
       .then(async response => {
         const json = await readApiResponse<StockResponse>(response, 'Loading inventory');
         if (!response.ok || !json.success || !json.data) {
@@ -227,7 +227,7 @@ export default function CustomerSaleForm({ onClose, onSaved }: { onClose: () => 
 
     setSubmitting(true);
     try {
-      const response = await fetch(`${BACKEND}/api/customer-sales`, {
+      const response = await fetch(`${API_BASE}/customer-sales`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
@@ -283,7 +283,7 @@ export default function CustomerSaleForm({ onClose, onSaved }: { onClose: () => 
       if (!response.ok || !result.success) {
         if (response.status === 409) {
           setForm(previous => ({ ...previous, vehicleId: '' }));
-          const stockResponse = await fetch(`${BACKEND}/api/available-scooters`, { credentials: 'include' });
+          const stockResponse = await fetch(`${API_BASE}/available-scooters`, { credentials: 'include' });
           const stockResult = await readApiResponse<StockResponse>(stockResponse, 'Refreshing inventory');
           if (stockResponse.ok && stockResult.success && stockResult.data) {
             setModels(stockResult.data.models);

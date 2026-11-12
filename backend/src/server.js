@@ -15,7 +15,10 @@ const {
 } = require('./models');
 const { sendWhatsAppReminder } = require('./services/whatsapp');
 const seedData = require('./data/seedData.cjs');
-const { authenticateAdmin, clearSessionCookie, createSessionCookie, isValidSession } = require('./services/auth');
+const {
+  authenticateAdmin, clearSessionCookie, createSessionCookie,
+  createSocketToken, isValidSession, isValidSocketToken
+} = require('./services/auth');
 
 const FRONTEND_ORIGINS = new Set([
   ...(process.env.FRONTEND_ORIGIN || (
@@ -59,7 +62,10 @@ const io = new Server(server, {
 
 io.use((socket, next) => {
   try {
-    if (isValidSession(socket.handshake.headers.cookie)) return next();
+    if (
+      isValidSession(socket.handshake.headers.cookie) ||
+      isValidSocketToken(socket.handshake.auth?.token)
+    ) return next();
     return next(new Error('Authentication required'));
   } catch (error) {
     console.error('[Socket] Authentication validation failed:', error.message);
@@ -190,6 +196,21 @@ app.get('/api/auth/session', (req, res) => {
     });
   } catch (error) {
     console.error('[Auth] Session check failed:', error.message);
+    return res.status(503).json({ success: false, message: 'Authentication is not configured.' });
+  }
+});
+
+app.get('/api/auth/socket-token', (req, res) => {
+  try {
+    if (!isValidSession(req.headers.cookie)) {
+      return res.status(401).json({ success: false, message: 'Sign in to continue.' });
+    }
+    return res.set('Cache-Control', 'no-store').json({
+      success: true,
+      token: createSocketToken()
+    });
+  } catch (error) {
+    console.error('[Auth] Socket token creation failed:', error.message);
     return res.status(503).json({ success: false, message: 'Authentication is not configured.' });
   }
 });

@@ -53,7 +53,7 @@ export default function ServicesView() {
   useEffect(() => {
     if (!serviceLoadPromise.current) {
       serviceLoadPromise.current = (async () => {
-        const response = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000'}/api/services`, {
+        const response = await fetch('/api/services', {
           credentials: 'include'
         });
         const result = await response.json();
@@ -163,7 +163,7 @@ export default function ServicesView() {
     setSavingService(true);
     setServiceError('');
     try {
-      const response = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000'}/api/services/${editingService.id}`, {
+      const response = await fetch(`/api/services/${editingService.id}`, {
         method: 'PUT',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
@@ -189,7 +189,7 @@ export default function ServicesView() {
     setSavingService(true);
     setServiceError('');
     try {
-      const response = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000'}/api/services/${service.id}/mark-done`, {
+      const response = await fetch(`/api/services/${service.id}/mark-done`, {
         method: 'PATCH',
         credentials: 'include'
       });

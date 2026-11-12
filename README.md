@@ -9,7 +9,9 @@
 
 Restart the backend after changing `backend/.env`; the server reads authentication settings at startup.
 
-The Express API and Socket.IO connection require the backend-issued, HTTP-only admin session cookie. Do not put admin credentials in `NEXT_PUBLIC_*` variables. Configure `FRONTEND_ORIGIN` to the exact deployed frontend origin in production. Sale confirmation uses MongoDB transactions; the MongoDB deployment must support transactions (for example, Atlas or a replica set).
+The Express API requires the backend-issued, HTTP-only admin session cookie; Socket.IO uses a short-lived token issued to an authenticated session. Do not put admin credentials in `NEXT_PUBLIC_*` variables. Configure `FRONTEND_ORIGIN` to the exact deployed frontend origin in production. Sale confirmation uses MongoDB transactions; the MongoDB deployment must support transactions (for example, Atlas or a replica set).
+
+In production, set `NEXT_PUBLIC_BACKEND_URL` in the frontend deployment to the backend origin (for example, the Render service URL) and redeploy the frontend. The frontend proxies `/api` requests through its own origin so browser authentication cookies remain first-party; Socket.IO uses a short-lived token issued to an authenticated session.
 
 ## Customer sales
 

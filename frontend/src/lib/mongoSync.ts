@@ -14,6 +14,20 @@ export function getMongoSocket(): Socket {
     socket = io(BACKEND_URL, {
       transports: ['websocket', 'polling'],
       withCredentials: true,
+      auth: (callback) => {
+        fetch('/api/auth/socket-token', { credentials: 'include' })
+          .then(async response => {
+            const result = await response.json();
+            if (!response.ok || !result.success || !result.token) {
+              throw new Error(result.message || 'Could not authenticate real-time connection.');
+            }
+            callback({ token: result.token });
+          })
+          .catch(error => {
+            console.error('[Real-Time] Socket authentication failed:', error);
+            callback({ token: '' });
+          });
+      },
       reconnectionAttempts: 10,
       reconnectionDelay: 2000
     });
@@ -24,6 +38,10 @@ export function getMongoSocket(): Socket {
 
     socket.on('disconnect', () => {
       console.warn('[Real-Time] Disconnected from MongoDB Atlas backend.');
+    });
+
+    socket.on('connect_error', error => {
+      console.error('[Real-Time] Socket connection failed:', error.message);
     });
   } else if (socket && !socket.connected) {
     socket.connect();
@@ -36,7 +54,7 @@ export function getMongoSocket(): Socket {
  */
 export async function pullDatabaseFromMongoDB(): Promise<{ success: boolean; data?: Partial<CRMDatabase>; message: string }> {
   try {
-    const res = await fetch(`${BACKEND_URL}/api/all`, { credentials: 'include' });
+    const res = await fetch('/api/all', { credentials: 'include' });
     if (!res.ok) {
       throw new Error(`HTTP error! status: ${res.status}`);
     }
@@ -63,7 +81,7 @@ export async function pullDatabaseFromMongoDB(): Promise<{ success: boolean; dat
  */
 export async function pushDatabaseToMongoDB(localDb: CRMDatabase): Promise<{ success: boolean; message: string }> {
   try {
-    const res = await fetch(`${BACKEND_URL}/api/sync-push`, {
+    const res = await fetch('/api/sync-push', {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
@@ -98,7 +116,7 @@ export async function dispatchWhatsAppReminder(
 
   // 1. Send update to Backend via API (updates MongoDB Atlas in real-time)
   try {
-    fetch(`${BACKEND_URL}/api/reminders/${reminder.id}/send-whatsapp`, {
+    fetch(`/api/reminders/${reminder.id}/send-whatsapp`, {
       method: 'POST',
       credentials: 'include'
     }).catch(e => console.warn('[WhatsApp] Backend notification warning:', e.message));
@@ -123,7 +141,7 @@ export async function dispatchWhatsAppReminder(
  */
 export async function resetMongoDBDatabase(): Promise<{ success: boolean; message: string }> {
   try {
-    const res = await fetch(`${BACKEND_URL}/api/seed`, { method: 'POST', credentials: 'include' });
+    const res = await fetch('/api/seed', { method: 'POST', credentials: 'include' });
     const json = await res.json();
     return {
       success: json.success,
@@ -142,7 +160,7 @@ export async function resetMongoDBDatabase(): Promise<{ success: boolean; messag
  */
 export async function wipeCleanMongoDB(): Promise<{ success: boolean; message: string }> {
   try {
-    const res = await fetch(`${BACKEND_URL}/api/wipe-clean`, { method: 'POST', credentials: 'include' });
+    const res = await fetch('/api/wipe-clean', { method: 'POST', credentials: 'include' });
     const json = await res.json();
     return {
       success: json.success,
