@@ -3,7 +3,7 @@
 import React, { useState } from 'react';
 import { useCRM } from '@/context/CRMContext';
 import { Customer } from '@/types/crm';
-import { formatCurrency, formatDate, exportToCSV } from '@/lib/storage';
+import { formatCurrency, formatDate, exportToCSV, parseCSV } from '@/lib/storage';
 import CustomerSaleForm from '@/components/modules/CustomerSaleForm';
 import {
   Users,
@@ -19,6 +19,7 @@ import {
   Trash2,
   FileText,
   Paperclip,
+  Upload,
   X,
   Archive,
   Edit2,
@@ -26,6 +27,12 @@ import {
 } from 'lucide-react';
 
 const API_BASE = '/api';
+
+function csvColumn(headers: string[], row: string[], ...names: string[]): string {
+  const candidates = names.map(name => name.toLowerCase().replace(/[^a-z0-9]/g, ''));
+  const index = headers.findIndex(header => candidates.includes(header.toLowerCase().replace(/[^a-z0-9]/g, '')));
+  return index < 0 ? '' : (row[index] || '').trim();
+}
 
 export default function CustomersView() {
   const {
@@ -53,12 +60,15 @@ export default function CustomersView() {
   const [editForm, setEditForm] = useState({ name: '', phone: '', email: '', currentAddress: '', permanentAddress: '', panNumber: '' });
   const [actionError, setActionError] = useState('');
   const [saleSuccess, setSaleSuccess] = useState('');
+  const [importMessage, setImportMessage] = useState('');
+  const [isImporting, setIsImporting] = useState(false);
 
   // Document upload state
   const [docType, setDocType] = useState<'Aadhaar' | 'PAN' | 'DrivingLicense' | 'ElectricityBill' | 'Photo' | 'Other'>('Aadhaar');
   const [docTitle, setDocTitle] = useState('');
   const [isUploadingDoc, setIsUploadingDoc] = useState(false);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const importInputRef = React.useRef<HTMLInputElement>(null);
 
   const selectedCustomer = customers.find(c => c.id === selectedCustomerId) || null;
 
@@ -127,6 +137,94 @@ export default function CustomersView() {
     }
   };
 
+  const handleImport = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+
+    let importedCount = 0;
+    setIsImporting(true);
+    try {
+      const parsed = parseCSV(await file.text());
+      if (parsed.length < 2) throw new Error('The CSV must include a header and at least one customer.');
+      const [headers, ...rows] = parsed;
+      const records = rows.map((row, index) => {
+        const name = csvColumn(headers, row, 'name', 'Customer Name');
+        const rawPhone = csvColumn(headers, row, 'phone', 'Phone');
+        const phone = rawPhone.replace(/\D/g, '').replace(/^91(?=\d{10}$)/, '');
+        const panNumber = csvColumn(headers, row, 'panNumber', 'PAN Number').toUpperCase();
+        if (!name || !/^[6-9]\d{9}$/.test(phone)) {
+          throw new Error(`Row ${index + 2}: customer name and a valid 10-digit Indian mobile number are required.`);
+        }
+        if (panNumber && !/^[A-Z]{5}\d{4}[A-Z]$/.test(panNumber)) {
+          throw new Error(`Row ${index + 2}: PAN number is invalid.`);
+        }
+        return {
+          rowNumber: index + 2,
+          name,
+          phone,
+          email: csvColumn(headers, row, 'email', 'Email'),
+          address: csvColumn(headers, row, 'currentAddress', 'address', 'Current Address'),
+          currentAddress: csvColumn(headers, row, 'currentAddress', 'address', 'Current Address'),
+          permanentAddress: csvColumn(headers, row, 'permanentAddress', 'Permanent Address'),
+          city: csvColumn(headers, row, 'city', 'City'),
+          pincode: csvColumn(headers, row, 'pincode', 'Pincode'),
+          panNumber,
+          notes: csvColumn(headers, row, 'notes', 'Notes')
+        };
+      });
+
+      const seenPhones = new Set<string>();
+      for (const record of records) {
+        if (seenPhones.has(record.phone) || customers.some(customer =>
+          customer.phone.replace(/\D/g, '').replace(/^91(?=\d{10}$)/, '') === record.phone
+        )) {
+          throw new Error(`Row ${record.rowNumber}: phone number ${record.phone} already belongs to a customer.`);
+        }
+        seenPhones.add(record.phone);
+      }
+
+      if (!window.confirm(`Import ${records.length} customer profile(s)?`)) return;
+      for (const record of records) {
+        const { rowNumber, ...customer } = record;
+        const response = await fetch(`${API_BASE}/customers`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...customer,
+            documents: [],
+            vehicleIds: [],
+            aadhaarNumber: '',
+            communicationPreference: 'WhatsApp'
+          })
+        });
+        const result = await response.json();
+        if (!response.ok || !result.success) {
+          throw new Error(`Row ${rowNumber}: ${result.message || 'Could not create customer.'}`);
+        }
+        importedCount += 1;
+      }
+
+      const syncResult = await syncFromMongoDB();
+      if (!syncResult.success) {
+        setImportMessage(`Imported ${importedCount} customer(s), but refreshing the customer list failed: ${syncResult.message}`);
+      } else {
+        setImportMessage(`Imported ${importedCount} customer(s) successfully.`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Customer CSV import failed.';
+      if (importedCount) {
+        const syncResult = await syncFromMongoDB();
+        setImportMessage(`Imported ${importedCount} customer(s) before stopping: ${message}${syncResult.success ? '' : ` Customer list refresh failed: ${syncResult.message}`}`);
+      } else {
+        setImportMessage(message);
+      }
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!selectedCustomer) return;
     const file = e.target.files?.[0];
@@ -175,16 +273,39 @@ export default function CustomersView() {
             Searchable customer profiles with multi-vehicle ownership, service timelines, and EMI schedules.
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <input ref={importInputRef} type="file" accept=".csv,text/csv" className="hidden" onChange={handleImport} />
           <button
-            onClick={() => exportToCSV(activeCustomers.map(customer => ({
+            onClick={() => importInputRef.current?.click()}
+            disabled={isImporting}
+            title="Import CSV with name and phone columns; customerCode and address fields are optional."
+            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold shadow-2xs transition disabled:opacity-50"
+          >
+            <Upload className="h-4 w-4" />
+            Import CSV
+          </button>
+          <button
+            onClick={() => exportToCSV(activeCustomers.length ? activeCustomers.map(customer => ({
               customerCode: customer.customerCode,
               name: customer.name,
               phone: customer.phone,
               email: customer.email,
               city: customer.city,
-              currentAddress: customer.currentAddress || customer.address
-            })), 'Showroom_Customers_Directory')}
+              currentAddress: customer.currentAddress || customer.address,
+              permanentAddress: customer.permanentAddress || '',
+              pincode: customer.pincode,
+              notes: customer.notes
+            })) : [{
+              customerCode: '',
+              name: '',
+              phone: '',
+              email: '',
+              city: '',
+              currentAddress: '',
+              permanentAddress: '',
+              pincode: '',
+              notes: ''
+            }], activeCustomers.length ? 'Showroom_Customers_Directory' : 'Showroom_Customers_Template')}
             className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold shadow-2xs transition"
           >
             <Download className="h-4 w-4" />
@@ -199,6 +320,13 @@ export default function CustomersView() {
           </button>
         </div>
       </div>
+
+      {importMessage && (
+        <div role="status" className="flex items-center justify-between gap-3 rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-800">
+          <span>{importMessage}</span>
+          <button onClick={() => setImportMessage('')} className="font-bold">Dismiss</button>
+        </div>
+      )}
 
       {/* Search Bar */}
       <div className="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-xs">
@@ -376,7 +504,7 @@ export default function CustomersView() {
                     <div className="mt-2 grid grid-cols-2 gap-2 text-[11px] sm:grid-cols-4">
                       <p>Final price<strong className="block text-slate-900">{formatCurrency(sale.finalSellingPrice ?? sale.totalOnRoadPrice)}</strong></p>
                       <p>Outstanding<strong className="block text-rose-700">{formatCurrency(sale.remainingAmount || 0)}</strong></p>
-                      <p>Chassis<strong className="block break-all font-mono">{sale.chassisVin || vehicles.find(vehicle => vehicle.id === sale.vehicleId)?.chassisVin || '—'}</strong></p>
+                      <p>Chassis<strong className="block break-all font-mono">{sale.chassisPending || vehicles.find(vehicle => vehicle.id === sale.vehicleId)?.chassisPending ? 'Pending assignment' : sale.chassisVin || vehicles.find(vehicle => vehicle.id === sale.vehicleId)?.chassisVin || '—'}</strong></p>
                       <p>Battery<strong className="block break-all font-mono">{sale.batterySerial || vehicles.find(vehicle => vehicle.id === sale.vehicleId)?.batterySerial || '—'}</strong></p>
                     </div>
                     {sale.paymentLedger?.map((payment, index) => (

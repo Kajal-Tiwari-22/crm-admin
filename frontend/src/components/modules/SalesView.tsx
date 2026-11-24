@@ -3,7 +3,7 @@
 import React, { useState } from 'react';
 import { useCRM } from '@/context/CRMContext';
 import { Sale, Vehicle, Customer, FinancingType } from '@/types/crm';
-import { formatCurrency, formatDate, exportToCSV } from '@/lib/storage';
+import { formatCurrency, formatDate, exportToCSV, parseCSV } from '@/lib/storage';
 import {
   ShoppingCart,
   Plus,
@@ -21,13 +21,22 @@ import {
   Paperclip
 } from 'lucide-react';
 
+function csvColumn(headers: string[], row: string[], ...names: string[]): string {
+  const candidates = names.map(name => name.toLowerCase().replace(/[^a-z0-9]/g, ''));
+  const index = headers.findIndex(header => candidates.includes(header.toLowerCase().replace(/[^a-z0-9]/g, '')));
+  return index < 0 ? '' : (row[index] || '').trim();
+}
+
 export default function SalesView() {
-  const { sales, vehicles, customers, recordSale, setSelectedSaleForInvoice, uploadSaleInvoice } = useCRM();
+  const { sales, vehicles, customers, emiSchedules, recordSale, setSelectedSaleForInvoice, uploadSaleInvoice } = useCRM();
 
   const [searchTerm, setSearchTerm] = useState('');
   const [isNewSaleOpen, setIsNewSaleOpen] = useState(false);
   const [activeSaleIdForUpload, setActiveSaleIdForUpload] = useState<string | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const importInputRef = React.useRef<HTMLInputElement>(null);
+  const [importMessage, setImportMessage] = useState('');
+  const [isImporting, setIsImporting] = useState(false);
 
   // Available vehicles only
   const availableVehicles = vehicles.filter(v => v.status === 'Available');
@@ -173,6 +182,190 @@ export default function SalesView() {
     }
   };
 
+  const handleImport = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+
+    let importedCount = 0;
+    setIsImporting(true);
+    try {
+      const parsed = parseCSV(await file.text());
+      if (parsed.length < 2) throw new Error('The CSV must include a header and at least one sale.');
+      const [headers, ...rows] = parsed;
+      const records = rows.map((row, index) => {
+        const customerKey = csvColumn(headers, row, 'customerCode', 'customerId', 'Customer Code');
+        const vehicleKey = csvColumn(headers, row, 'chassisVin', 'vehicleId', 'Chassis VIN');
+        const customer = customers.find(item => item.customerCode.toLowerCase() === customerKey.toLowerCase() || item.id === customerKey);
+        const vehicle = vehicles.find(item => item.chassisVin.toUpperCase() === vehicleKey.toUpperCase() || item.id === vehicleKey);
+        const saleDate = csvColumn(headers, row, 'saleDate', 'Sale Date');
+        const deliveryDate = csvColumn(headers, row, 'deliveryDate', 'Delivery Date') || saleDate;
+        const financingType = csvColumn(headers, row, 'financingType', 'Financing Type') as FinancingType;
+        const financeCompanyName = csvColumn(headers, row, 'financeCompanyName', 'Finance Company');
+        const rawTenure = csvColumn(headers, row, 'emiTenureMonths', 'EMI Tenure Months');
+        const rawInterestRate = csvColumn(headers, row, 'emiInterestRate', 'EMI Interest Rate');
+        const emiTenureMonths = rawTenure ? Number(rawTenure) : 12;
+        const emiInterestRate = rawInterestRate ? Number(rawInterestRate) : financingType === 'ShowroomDirect' ? 0 : 10.5;
+        const amounts = {
+          exShowroomPrice: Number(csvColumn(headers, row, 'exShowroomPrice', 'Ex-Showroom Price')),
+          discount: Number(csvColumn(headers, row, 'discount', 'Discount')),
+          gstAmount: Number(csvColumn(headers, row, 'gstAmount', 'GST Amount')),
+          accessoriesAmount: Number(csvColumn(headers, row, 'accessoriesAmount', 'Accessories Amount')),
+          insuranceAmount: Number(csvColumn(headers, row, 'insuranceAmount', 'Insurance Amount')),
+          registrationAmount: Number(csvColumn(headers, row, 'registrationAmount', 'Registration Amount')),
+          totalOnRoadPrice: Number(csvColumn(headers, row, 'totalOnRoadPrice', 'Total On-Road Price')),
+          bookingAmount: Number(csvColumn(headers, row, 'bookingAmount', 'Booking Amount')),
+          downPayment: Number(csvColumn(headers, row, 'downPayment', 'Down Payment'))
+        };
+        const rawChecklist = csvColumn(headers, row, 'deliveryChecklistJson', 'Delivery Checklist JSON');
+        const defaultChecklist: Sale['deliveryChecklist'] = {
+          batteryFullyCharged: false,
+          smartChargerHanded: false,
+          twoKeysGiven: false,
+          toolkitAndFirstAidGiven: false,
+          ownerManualGiven: false,
+          appPairedAndSetup: false,
+          pdiTestRunCompleted: false,
+          customerSignatureTaken: false
+        };
+        let deliveryChecklist = defaultChecklist;
+        if (rawChecklist) {
+          try {
+            const parsedChecklist = JSON.parse(rawChecklist);
+            if (!parsedChecklist || typeof parsedChecklist !== 'object' || Array.isArray(parsedChecklist) ||
+                Object.values(parsedChecklist).some(value => typeof value !== 'boolean')) {
+              throw new Error('Checklist values must be booleans.');
+            }
+            deliveryChecklist = { ...defaultChecklist, ...parsedChecklist };
+          } catch {
+            throw new Error(`Row ${index + 2}: delivery checklist JSON is invalid.`);
+          }
+        }
+
+        if (!customer || !vehicle || vehicle.status !== 'Available') {
+          throw new Error(`Row ${index + 2}: customer or available vehicle could not be matched. Use customerCode and chassisVin from the CRM.`);
+        }
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(saleDate) || !/^\d{4}-\d{2}-\d{2}$/.test(deliveryDate)) {
+          throw new Error(`Row ${index + 2}: valid saleDate and deliveryDate are required (YYYY-MM-DD).`);
+        }
+        if (Number.isNaN(new Date(`${saleDate}T12:00:00`).getTime()) || Number.isNaN(new Date(`${deliveryDate}T12:00:00`).getTime())) {
+          throw new Error(`Row ${index + 2}: saleDate and deliveryDate must be valid calendar dates.`);
+        }
+        if (!['Cash/Self', 'FinanceCompany', 'ShowroomDirect'].includes(financingType)) {
+          throw new Error(`Row ${index + 2}: financingType must be Cash/Self, FinanceCompany, or ShowroomDirect.`);
+        }
+        if (financingType === 'FinanceCompany' && !financeCompanyName) {
+          throw new Error(`Row ${index + 2}: financeCompanyName is required for finance-company sales.`);
+        }
+        if (financingType !== 'Cash/Self' &&
+            (!Number.isInteger(emiTenureMonths) || emiTenureMonths < 1 || emiTenureMonths > 120 ||
+             !Number.isFinite(emiInterestRate) || emiInterestRate < 0 || emiInterestRate > 100)) {
+          throw new Error(`Row ${index + 2}: EMI tenure must be 1–120 months and interest rate must be 0–100.`);
+        }
+        if (Object.values(amounts).some(amount => !Number.isFinite(amount) || amount < 0) ||
+            amounts.exShowroomPrice <= 0 || amounts.totalOnRoadPrice <= 0) {
+          throw new Error(`Row ${index + 2}: all prices must be valid non-negative amounts and the sale price must be greater than zero.`);
+        }
+
+        return {
+          rowNumber: index + 2,
+          customerId: customer.id,
+          vehicleId: vehicle.id,
+          saleDate,
+          deliveryDate,
+          ...amounts,
+          financingType,
+          financeCompanyName,
+          loanAccountRef: csvColumn(headers, row, 'loanAccountRef', 'Loan Account Ref'),
+          salespersonName: csvColumn(headers, row, 'salespersonName', 'Salesperson') || 'Imported',
+          registrationNumber: csvColumn(headers, row, 'registrationNumber', 'Registration Number'),
+          handoverNotes: csvColumn(headers, row, 'handoverNotes', 'Handover Notes'),
+          emiTenureMonths,
+          emiInterestRate,
+          deliveryChecklist
+        };
+      });
+
+      const importedVehicles = new Set<string>();
+      for (const record of records) {
+        if (importedVehicles.has(record.vehicleId)) {
+          throw new Error(`Row ${record.rowNumber}: the same vehicle appears more than once in this CSV.`);
+        }
+        importedVehicles.add(record.vehicleId);
+      }
+
+      if (!window.confirm(`This will record ${records.length} sale(s), update vehicle stock, and generate related payment/service records. Continue?`)) return;
+      for (const record of records) {
+        const { rowNumber, ...saleData } = record;
+        const result = await recordSale(saleData);
+        if (!result.success) throw new Error(`Row ${rowNumber}: ${result.message || 'Could not record sale.'}`);
+        importedCount += 1;
+      }
+      setImportMessage(`Imported ${importedCount} sale(s) successfully.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Sales CSV import failed.';
+      setImportMessage(importedCount ? `Imported ${importedCount} sale(s) before stopping: ${message}` : message);
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  const handleExport = () => {
+    const exportRows = sales.map(sale => {
+      const customer = customers.find(item => item.id === sale.customerId);
+      const vehicle = vehicles.find(item => item.id === sale.vehicleId);
+      const schedule = emiSchedules.find(item => item.saleId === sale.id);
+      return {
+        customerCode: customer?.customerCode || '',
+        chassisVin: vehicle?.chassisPending ? '' : vehicle?.chassisVin || sale.chassisVin || '',
+        saleDate: sale.saleDate,
+        deliveryDate: sale.deliveryDate || sale.saleDate,
+        exShowroomPrice: sale.exShowroomPrice,
+        discount: sale.discount,
+        gstAmount: sale.gstAmount,
+        accessoriesAmount: sale.accessoriesAmount,
+        insuranceAmount: sale.insuranceAmount,
+        registrationAmount: sale.registrationAmount,
+        totalOnRoadPrice: sale.totalOnRoadPrice,
+        bookingAmount: sale.bookingAmount,
+        downPayment: sale.downPayment,
+        financingType: sale.financingType,
+        financeCompanyName: sale.financeCompanyName || '',
+        loanAccountRef: sale.loanAccountRef || '',
+        emiTenureMonths: schedule?.tenureMonths || '',
+        emiInterestRate: schedule?.interestRateAnnual || '',
+        salespersonName: sale.salespersonName,
+        registrationNumber: sale.registrationNumber || '',
+        handoverNotes: sale.handoverNotes || '',
+        deliveryChecklistJson: JSON.stringify(sale.deliveryChecklist)
+      };
+    });
+    exportToCSV(exportRows.length ? exportRows : [{
+      customerCode: '',
+      chassisVin: '',
+      saleDate: '',
+      deliveryDate: '',
+      exShowroomPrice: '',
+      discount: '',
+      gstAmount: '',
+      accessoriesAmount: '',
+      insuranceAmount: '',
+      registrationAmount: '',
+      totalOnRoadPrice: '',
+      bookingAmount: '',
+      downPayment: '',
+      financingType: '',
+      financeCompanyName: '',
+      loanAccountRef: '',
+      emiTenureMonths: '',
+      emiInterestRate: '',
+      salespersonName: '',
+      registrationNumber: '',
+      handoverNotes: '',
+      deliveryChecklistJson: ''
+    }], 'Sales_Import_Template');
+  };
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -186,9 +379,19 @@ export default function SalesView() {
             Create sales orders, auto-generate tax invoices, calculate EMIs, and atomically mark stock as Sold.
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <input ref={importInputRef} type="file" accept=".csv,text/csv" className="hidden" onChange={handleImport} />
           <button
-            onClick={() => exportToCSV(sales, 'Sales_Invoices_Report')}
+            onClick={() => importInputRef.current?.click()}
+            disabled={isImporting}
+            title="Import sales using customerCode and an available vehicle chassisVin. Import records real sales and updates stock."
+            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold shadow-2xs transition disabled:opacity-50"
+          >
+            <Upload className="h-4 w-4" />
+            Import CSV
+          </button>
+          <button
+            onClick={handleExport}
             className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold shadow-2xs transition"
           >
             <Download className="h-4 w-4" />
@@ -209,6 +412,13 @@ export default function SalesView() {
           </button>
         </div>
       </div>
+
+      {importMessage && (
+        <div role="status" className="flex items-center justify-between gap-3 rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-800">
+          <span>{importMessage}</span>
+          <button onClick={() => setImportMessage('')} className="font-bold">Dismiss</button>
+        </div>
+      )}
 
       {/* Search */}
       <div className="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-xs">
@@ -258,7 +468,7 @@ export default function SalesView() {
                       </td>
                       <td className="p-3.5">
                         <div className="font-bold text-slate-900">{veh?.brand} {veh?.model}</div>
-                        <div className="text-[10px] font-mono text-slate-500">{veh?.chassisVin}</div>
+                        <div className="text-[10px] font-mono text-slate-500">{veh?.chassisPending ? 'Chassis pending' : veh?.chassisVin}</div>
                       </td>
                       <td className="p-3.5">
                         <span className="font-medium text-slate-800">{s.financingType}</span>
@@ -378,7 +588,7 @@ export default function SalesView() {
                   >
                     {availableVehicles.map(v => (
                       <option key={v.id} value={v.id}>
-                        {v.brand} {v.model} ({v.color}) - VIN: {v.chassisVin} [{formatCurrency(v.sellingPrice)}]
+                        {v.brand} {v.model} ({v.color}) - {v.chassisPending ? 'Chassis pending' : `VIN: ${v.chassisVin}`} [{formatCurrency(v.sellingPrice)}]
                       </option>
                     ))}
                   </select>

@@ -165,21 +165,65 @@ export function exportToCSV(data: any[], filename: string): void {
   }
 
   const headers = Object.keys(data[0]);
+  const escapeValue = (value: unknown) => {
+    const text = value === null || value === undefined
+      ? ''
+      : typeof value === 'object'
+        ? JSON.stringify(value)
+        : String(value);
+    return `"${text.replace(/"/g, '""')}"`;
+  };
   const rows = data.map(item =>
-    headers.map(header => {
-      const val = item[header];
-      if (val === null || val === undefined) return '""';
-      if (typeof val === 'object') return `"${JSON.stringify(val).replace(/"/g, '""')}"`;
-      return `"${String(val).replace(/"/g, '""')}"`;
-    }).join(',')
+    headers.map(header => escapeValue(item[header])).join(',')
   );
 
-  const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows].join('\n');
-  const encodedUri = encodeURI(csvContent);
+  const csvContent = `\ufeff${[headers.map(escapeValue).join(','), ...rows].join('\r\n')}`;
+  const url = URL.createObjectURL(new Blob([csvContent], { type: 'text/csv;charset=utf-8' }));
   const link = document.createElement('a');
-  link.setAttribute('href', encodedUri);
+  link.setAttribute('href', url);
   link.setAttribute('download', `${filename}_${new Date().toISOString().slice(0, 10)}.csv`);
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export function parseCSV(content: string): string[][] {
+  const rows: string[][] = [];
+  const input = content.charCodeAt(0) === 0xfeff ? content.slice(1) : content;
+  let row: string[] = [];
+  let value = '';
+  let inQuotes = false;
+
+  for (let index = 0; index < input.length; index += 1) {
+    const character = input[index];
+    if (inQuotes) {
+      if (character === '"' && input[index + 1] === '"') {
+        value += '"';
+        index += 1;
+      } else if (character === '"') {
+        inQuotes = false;
+      } else {
+        value += character;
+      }
+    } else if (character === '"' && value.length === 0) {
+      inQuotes = true;
+    } else if (character === ',') {
+      row.push(value);
+      value = '';
+    } else if (character === '\n' || character === '\r') {
+      if (character === '\r' && input[index + 1] === '\n') index += 1;
+      row.push(value);
+      if (row.some(cell => cell.trim())) rows.push(row);
+      row = [];
+      value = '';
+    } else {
+      value += character;
+    }
+  }
+
+  if (inQuotes) throw new Error('CSV contains an unclosed quoted field.');
+  row.push(value);
+  if (row.some(cell => cell.trim())) rows.push(row);
+  return rows;
 }

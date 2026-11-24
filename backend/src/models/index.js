@@ -39,6 +39,7 @@ const VehicleSchema = new Schema({
   inventoryBatchId: { type: String, default: '' },        // Links to InventoryBatch
   modelNumber: { type: String, default: '' },             // e.g. E-Scoot 207
   chassisVin: { type: String, required: true, unique: true },
+  chassisPending: { type: Boolean, default: false },
   motorNumber: { type: String, default: '' },
   batterySerial: { type: String, default: '' },
   batteryCapacityKwh: { type: Number, default: 0 },
@@ -111,6 +112,7 @@ const SaleSchema = new Schema({
   modelNumber: { type: String, default: '' },
   companyName: { type: String, default: '' },
   chassisVin: { type: String, default: '' },
+  chassisPending: { type: Boolean, default: false },
   batterySerial: { type: String, default: '' },
   purchaseCostSnapshot: { type: Number, default: 0 },
   finalSellingPrice: { type: Number, default: 0 },

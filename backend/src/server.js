@@ -536,7 +536,47 @@ app.put('/api/vehicles/:id', async (req, res) => {
         message: 'A scooter with a completed sale cannot be returned to available stock.'
       });
     }
-    const updated = await Vehicle.findOneAndUpdate({ id: req.params.id }, req.body, { new: true });
+    const updates = { ...req.body };
+    delete updates.chassisPending;
+    let assignedChassis = '';
+    if (Object.prototype.hasOwnProperty.call(req.body, 'chassisVin')) {
+      assignedChassis = String(req.body.chassisVin || '').trim().toUpperCase();
+      if (!assignedChassis || assignedChassis.startsWith('PENDING-')) {
+        return res.status(400).json({ success: false, message: 'Enter the actual chassis number to assign this unit.' });
+      }
+      const duplicate = await Vehicle.findOne({ chassisVin: assignedChassis, id: { $ne: current.id } });
+      if (duplicate) {
+        return res.status(409).json({ success: false, message: `Chassis/VIN "${assignedChassis}" already exists in inventory.` });
+      }
+      updates.chassisVin = assignedChassis;
+      updates.chassisPending = false;
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body, 'batterySerial')) {
+      const batterySerial = String(req.body.batterySerial || '').trim().toUpperCase();
+      if (batterySerial) {
+        const duplicateBattery = await Vehicle.findOne({ batterySerial, id: { $ne: current.id } });
+        if (duplicateBattery) {
+          return res.status(409).json({ success: false, message: `Battery serial "${batterySerial}" is already assigned to another unit.` });
+        }
+      }
+      updates.batterySerial = batterySerial;
+    }
+
+    const updated = await Vehicle.findOneAndUpdate({ id: req.params.id }, updates, { new: true, runValidators: true });
+    if (assignedChassis) {
+      const updatedSale = await Sale.findOneAndUpdate(
+        { vehicleId: current.id },
+        { chassisVin: assignedChassis, chassisPending: false },
+        { new: true }
+      );
+      await WarrantyInsurance.updateMany(
+        { vehicleId: current.id },
+        { chassisVin: assignedChassis }
+      );
+      if (updatedSale) {
+        io.emit('db_update', { collection: 'sales', action: 'update', data: updatedSale });
+      }
+    }
     io.emit('db_update', { collection: 'vehicles', action: 'update', data: updated });
     await broadcastFullSync();
     res.json({ success: true, data: updated });
@@ -620,42 +660,40 @@ app.post('/api/inventory-batches', async (req, res) => {
     // Generate batch
     const batchCount = await InventoryBatch.countDocuments();
     const batchCode = `BATCH-${new Date().getFullYear()}-${String(batchCount + 1).padStart(3, '0')}`;
-    const batchId = `batch-${Date.now()}`;
+    const batchId = `batch-${crypto.randomUUID()}`;
 
-    // Create individual Vehicle documents for each unit
+    // Keep every purchased unit available for sale, even before its chassis is assigned.
     const createdVehicleIds = [];
     for (let i = 0; i < Number(quantity); i++) {
       const unit = units[i] || {};
       const vin = (unit.chassisNumber || '').trim().toUpperCase();
       const bs = (unit.batterySerial || '').trim().toUpperCase();
-      const vehId = `veh-${Date.now()}-${i}`;
-
-      if (vin) {
-        const veh = new Vehicle({
-          id: vehId,
-          brand: companyName.trim(),
-          model: modelNumber.trim(),
-          modelNumber: modelNumber.trim(),
-          variant: '',
-          color: unit.color || '',
-          lightType: lightType || 'Single Light',
-          companyName: companyName.trim(),
-          batteryCompanyName: batteryCompanyName || '',
-          hsnCode: hsnCode || '',
-          chassisVin: vin,
-          motorNumber: (unit.motorNumber || '').trim().toUpperCase(),
-          batterySerial: bs,
-          purchasePrice: Number(purchaseCostPerUnit),
-          purchaseDate: purchaseDate,
-          supplierInvoiceNo: invoiceNumber || '',
-          batteryWarrantyMonths: Number(batteryWarrantyMonths) || 36,
-          inventoryBatchId: batchId,
-          status: 'Available',
-          location: 'Showroom Floor'
-        });
-        await veh.save();
-        createdVehicleIds.push(vehId);
-      }
+      const vehId = `veh-${crypto.randomUUID()}`;
+      const veh = new Vehicle({
+        id: vehId,
+        brand: companyName.trim(),
+        model: modelNumber.trim(),
+        modelNumber: modelNumber.trim(),
+        variant: '',
+        color: unit.color || '',
+        lightType: lightType || 'Single Light',
+        companyName: companyName.trim(),
+        batteryCompanyName: batteryCompanyName || '',
+        hsnCode: hsnCode || '',
+        chassisVin: vin || `PENDING-${vehId.toUpperCase()}`,
+        chassisPending: !vin,
+        motorNumber: (unit.motorNumber || '').trim().toUpperCase(),
+        batterySerial: bs,
+        purchasePrice: Number(purchaseCostPerUnit),
+        purchaseDate: purchaseDate,
+        supplierInvoiceNo: invoiceNumber || '',
+        batteryWarrantyMonths: Number(batteryWarrantyMonths) || 36,
+        inventoryBatchId: batchId,
+        status: 'Available',
+        location: 'Showroom Floor'
+      });
+      await veh.save();
+      createdVehicleIds.push(vehId);
     }
 
     const batch = new InventoryBatch({
@@ -669,7 +707,7 @@ app.post('/api/inventory-batches', async (req, res) => {
       purchaseDate,
       purchaseCostPerUnit: Number(purchaseCostPerUnit),
       quantity: Number(quantity),
-      availableQty: createdVehicleIds.length > 0 ? createdVehicleIds.length : Number(quantity),
+      availableQty: createdVehicleIds.length,
       soldQty: 0,
       invoiceNumber: invoiceNumber || '',
       supplierName: supplierName || '',
@@ -708,6 +746,83 @@ app.get('/api/inventory-batches/:id', async (req, res) => {
     const units = await Vehicle.find({ inventoryBatchId: req.params.id }).sort({ createdAt: 1 });
     res.json({ success: true, data: { batch, units } });
   } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.post('/api/inventory-batches/:id/register-missing-units', async (req, res) => {
+  try {
+    const batch = await InventoryBatch.findOne({ id: req.params.id });
+    if (!batch) return res.status(404).json({ success: false, message: 'Batch not found.' });
+    if (batch.status === 'Archived') {
+      return res.status(409).json({ success: false, message: 'Archived batches cannot be made available for sale.' });
+    }
+
+    const existingUnits = await Vehicle.find({ inventoryBatchId: batch.id });
+    const availableUnits = existingUnits.filter(unit => unit.status === 'Available').length;
+    const targetAvailable = Number(batch.availableQty ?? Math.max(0, batch.quantity - batch.soldQty));
+    const missingCount = Math.min(
+      Math.max(0, Number(batch.quantity) - existingUnits.length),
+      Math.max(0, targetAvailable - availableUnits)
+    );
+    if (!missingCount) {
+      return res.json({ success: true, createdCount: 0, message: 'All available batch units already have vehicle records.' });
+    }
+
+    const createdIds = [];
+    for (let index = 0; index < missingCount; index += 1) {
+      const id = `veh-${crypto.randomUUID()}`;
+      const vehicle = new Vehicle({
+        id,
+        brand: batch.companyName,
+        model: batch.modelNumber,
+        modelNumber: batch.modelNumber,
+        variant: '',
+        color: '',
+        lightType: batch.lightType,
+        companyName: batch.companyName,
+        batteryCompanyName: batch.batteryCompanyName,
+        hsnCode: batch.hsnCode,
+        chassisVin: `PENDING-${id.toUpperCase()}`,
+        chassisPending: true,
+        motorNumber: '',
+        batterySerial: '',
+        purchasePrice: batch.purchaseCostPerUnit,
+        purchaseDate: batch.purchaseDate,
+        supplierInvoiceNo: batch.invoiceNumber,
+        batteryWarrantyMonths: batch.batteryWarrantyMonths,
+        inventoryBatchId: batch.id,
+        status: 'Available',
+        location: 'Showroom Floor'
+      });
+      await vehicle.save();
+      createdIds.push(id);
+    }
+
+    const updatedUnits = await Vehicle.find({ inventoryBatchId: batch.id });
+    batch.unitIds = Array.from(new Set([...(batch.unitIds || []), ...createdIds]));
+    batch.availableQty = updatedUnits.filter(unit => unit.status === 'Available').length;
+    if (batch.availableQty > 0) batch.status = 'Active';
+    await batch.save();
+
+    await AuditLog.create({
+      id: `aud-${crypto.randomUUID()}`,
+      timestamp: new Date().toISOString(),
+      userName: process.env.ADMIN_NAME || 'Administrator',
+      userRole: 'Owner',
+      action: 'REGISTER_PENDING_INVENTORY_UNITS',
+      module: 'Inventory',
+      details: `Created ${createdIds.length} saleable unit record(s) for batch ${batch.batchCode} with chassis pending.`
+    });
+    io.emit('db_update', { collection: 'inventoryBatches', action: 'update', data: batch });
+    await broadcastFullSync();
+    res.json({
+      success: true,
+      createdCount: createdIds.length,
+      message: `Registered ${createdIds.length} missing unit(s) for sale.`
+    });
+  } catch (err) {
+    console.error('[Inventory Batch] Register missing units error:', err);
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -1235,7 +1350,8 @@ app.post('/api/customer-sales', async (req, res) => {
         paymentLedger: initialLedger,
         modelNumber: vehicle.modelNumber || vehicle.model,
         companyName: vehicle.companyName || vehicle.brand,
-        chassisVin: vehicle.chassisVin,
+        chassisVin: vehicle.chassisPending ? '' : vehicle.chassisVin,
+        chassisPending: Boolean(vehicle.chassisPending),
         batterySerial: vehicle.batterySerial,
         purchaseCostSnapshot: vehicle.purchasePrice || 0,
         pendingDocuments: [],
@@ -1305,7 +1421,7 @@ app.post('/api/customer-sales', async (req, res) => {
         id: `warranty-${crypto.randomUUID()}`,
         vehicleId: vehicle.id,
         vehicleModel: `${vehicle.brand} ${vehicle.model}`,
-        chassisVin: vehicle.chassisVin,
+        chassisVin: vehicle.chassisPending ? '' : vehicle.chassisVin,
         customerId,
         customerName: customer.name,
         policyType: 'Vehicle Warranty',

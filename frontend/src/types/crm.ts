@@ -46,6 +46,7 @@ export interface Vehicle {
   hsnCode?: string;
   inventoryBatchId?: string;
   chassisVin: string;
+  chassisPending?: boolean;
   motorNumber: string;
   batterySerial: string;
   batteryCapacityKwh: number;
@@ -131,6 +132,7 @@ export interface Sale {
   modelNumber?: string;
   companyName?: string;
   chassisVin?: string;
+  chassisPending?: boolean;
   batterySerial?: string;
   purchaseCostSnapshot?: number;
   finalSellingPrice?: number;

@@ -3,9 +3,9 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { useCRM } from '@/context/CRMContext';
 import { InventoryBatch, InventoryUnit, Vehicle } from '@/types/crm';
-import { formatCurrency, formatDate } from '@/lib/storage';
+import { formatCurrency, formatDate, exportToCSV, parseCSV } from '@/lib/storage';
 import {
-  Bike, Plus, Search, Download, X, Eye, Edit2, Trash2,
+  Bike, Plus, Search, Download, Upload, X, Eye, Edit2, Trash2,
   AlertCircle, CheckCircle2, ChevronLeft, ChevronRight,
   Package, Zap, Filter, RefreshCw, Archive, PlusCircle,
   Hash, Calendar, IndianRupee, Lightbulb, Factory, Battery,
@@ -16,6 +16,7 @@ import {
 type ModalMode = 'add' | 'edit' | 'view' | 'addUnits' | null;
 
 interface UnitRow {
+  vehicleId?: string;
   chassisNumber: string;
   batterySerial: string;
   color: string;
@@ -73,6 +74,58 @@ function defaultForm(): BatchFormData {
 }
 
 function parsedQty(s: string): number { const n = parseInt(s, 10); return isNaN(n) ? 0 : n; }
+
+function csvColumn(headers: string[], row: string[], ...names: string[]): string {
+  const candidates = names.map(name => name.toLowerCase().replace(/[^a-z0-9]/g, ''));
+  const index = headers.findIndex(header => candidates.includes(header.toLowerCase().replace(/[^a-z0-9]/g, '')));
+  return index < 0 ? '' : (row[index] || '').trim();
+}
+
+function parseInventoryDate(value: string): string | null {
+  const text = value.trim();
+  let year: number;
+  let month: number;
+  let day: number;
+
+  const iso = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  const localized = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+  if (iso) {
+    year = Number(iso[1]);
+    month = Number(iso[2]);
+    day = Number(iso[3]);
+  } else if (localized) {
+    const first = Number(localized[1]);
+    const second = Number(localized[2]);
+    year = Number(localized[3]);
+    if (first > 12) {
+      day = first;
+      month = second;
+    } else if (second > 12) {
+      month = first;
+      day = second;
+    } else {
+      day = first;
+      month = second;
+    }
+  } else {
+    const serial = Number(text);
+    if (!Number.isInteger(serial) || serial < 1) return null;
+    const adjustedSerial = serial > 60 ? serial - 1 : serial;
+    const date = new Date(Date.UTC(1899, 11, 31 + adjustedSerial));
+    if (Number.isNaN(date.getTime())) return null;
+    year = date.getUTCFullYear();
+    month = date.getUTCMonth() + 1;
+    day = date.getUTCDate();
+  }
+
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() + 1 !== month || date.getUTCDate() !== day) return null;
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function parseInventoryNumber(value: string): number {
+  return Number(value.replace(/₹|Rs\.?|INR/gi, '').replace(/,/g, '').replace(/\s/g, '').replace(/\/-$/, '').trim());
+}
 
 function statusBadge(status: string) {
   switch (status) {
@@ -202,7 +255,7 @@ function UnitsTable({ units, setUnits, qty, modelNumber }: {
 
 // ─── Main Component ────────────────────────────────────────────────────────
 export default function InventoryView() {
-  const { inventoryBatches, vehicles, addInventoryBatch, updateInventoryBatch, deleteInventoryBatch, addUnitsToInventoryBatch } = useCRM();
+  const { inventoryBatches, vehicles, addInventoryBatch, updateInventoryBatch, deleteInventoryBatch, addUnitsToInventoryBatch, syncFromMongoDB } = useCRM();
 
   // ── List state ────────────────────────────────────────────────────────
   const [searchTerm, setSearchTerm] = useState('');
@@ -216,6 +269,9 @@ export default function InventoryView() {
   const [selectedBatch, setSelectedBatch] = useState<InventoryBatch | null>(null);
   const [batchUnits, setBatchUnits] = useState<Vehicle[]>([]);
   const [loadingUnits, setLoadingUnits] = useState(false);
+  const [chassisAssignments, setChassisAssignments] = useState<Record<string, string>>({});
+  const [savingChassisId, setSavingChassisId] = useState<string | null>(null);
+  const [registeringMissingUnits, setRegisteringMissingUnits] = useState(false);
 
   // ── Form state ────────────────────────────────────────────────────────
   const [form, setForm] = useState<BatchFormData>(defaultForm());
@@ -227,6 +283,8 @@ export default function InventoryView() {
   // ── Notifications ─────────────────────────────────────────────────────
   const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null);
   const showToast = useCallback((msg: string, type: 'success' | 'error') => setToast({ msg, type }), []);
+  const importInputRef = React.useRef<HTMLInputElement>(null);
+  const [isImporting, setIsImporting] = useState(false);
 
   const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000';
 
@@ -271,6 +329,66 @@ export default function InventoryView() {
     }
   };
 
+  const assignChassisNumber = async (vehicle: Vehicle) => {
+    const chassisNumber = (chassisAssignments[vehicle.id] || '').trim().toUpperCase();
+    if (!chassisNumber) {
+      showToast('Enter the actual chassis number before assigning it.', 'error');
+      return;
+    }
+
+    setSavingChassisId(vehicle.id);
+    try {
+      const response = await fetch(`${BACKEND}/api/vehicles/${vehicle.id}`, {
+        method: 'PUT',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chassisVin: chassisNumber })
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || 'Could not assign chassis number.');
+      }
+
+      const syncResult = await syncFromMongoDB();
+      if (!syncResult.success) {
+        throw new Error(`Chassis was assigned, but refreshing inventory failed: ${syncResult.message}`);
+      }
+      if (selectedBatch) await fetchBatchUnits(selectedBatch.id);
+      setChassisAssignments(current => ({ ...current, [vehicle.id]: chassisNumber }));
+      showToast(`Chassis ${chassisNumber} assigned successfully.`, 'success');
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Could not assign chassis number.', 'error');
+    } finally {
+      setSavingChassisId(null);
+    }
+  };
+
+  const registerMissingUnits = async () => {
+    if (!selectedBatch) return;
+    setRegisteringMissingUnits(true);
+    try {
+      const response = await fetch(`${BACKEND}/api/inventory-batches/${selectedBatch.id}/register-missing-units`, {
+        method: 'POST',
+        credentials: 'include'
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || 'Could not make missing units available for sale.');
+      }
+
+      const syncResult = await syncFromMongoDB();
+      if (!syncResult.success) {
+        throw new Error(`Units were registered, but refreshing inventory failed: ${syncResult.message}`);
+      }
+      await fetchBatchUnits(selectedBatch.id);
+      showToast(result.message || 'Missing units are now available for sale.', 'success');
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Could not make missing units available for sale.', 'error');
+    } finally {
+      setRegisteringMissingUnits(false);
+    }
+  };
+
   // ── Open modal helpers ─────────────────────────────────────────────────
   const openAdd = () => {
     setForm(defaultForm());
@@ -287,6 +405,10 @@ export default function InventoryView() {
 
   const openEdit = (batch: InventoryBatch) => {
     setSelectedBatch(batch);
+    const batchVehicles = vehicles.filter(vehicle => vehicle.inventoryBatchId === batch.id);
+    const missingAvailableUnits = batch.status === 'Archived'
+      ? 0
+      : Math.max(0, (batch.availableQty ?? batch.quantity) - batchVehicles.filter(vehicle => vehicle.status === 'Available').length);
     setForm({
       modelNumber: batch.modelNumber,
       lightType: batch.lightType,
@@ -300,7 +422,16 @@ export default function InventoryView() {
       supplierName: batch.supplierName,
       batteryWarrantyMonths: String(batch.batteryWarrantyMonths || 36),
       stockNotes: batch.stockNotes,
-      units: []
+      units: [
+        ...batchVehicles.map(vehicle => ({
+          vehicleId: vehicle.id,
+          chassisNumber: vehicle.chassisPending || vehicle.chassisVin.startsWith('PENDING-') ? '' : vehicle.chassisVin,
+          batterySerial: vehicle.batterySerial || '',
+          color: vehicle.color || '',
+          motorNumber: vehicle.motorNumber || ''
+        })),
+        ...Array.from({ length: missingAvailableUnits }, emptyUnit)
+      ]
     });
     setErrors({});
     setModalMode('edit');
@@ -371,32 +502,151 @@ export default function InventoryView() {
   const handleEditSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedBatch) return;
-    if (!form.modelNumber.trim() || !form.companyName.trim() || !form.purchaseDate) {
-      setErrors({ submit: 'Model, company, and purchase date are required.' });
+    if (!validate()) return;
+
+    const unitErrors: FieldError = {};
+    const chassisNumbers = new Set<string>();
+    const batterySerials = new Set<string>();
+    for (const unit of form.units) {
+      const currentVehicle = unit.vehicleId
+        ? vehicles.find(vehicle => vehicle.id === unit.vehicleId)
+        : undefined;
+
+      const chassis = unit.chassisNumber.trim().toUpperCase();
+      const currentChassisPending = !currentVehicle || currentVehicle.chassisPending || currentVehicle.chassisVin.startsWith('PENDING-');
+      if (!chassis && !currentChassisPending) {
+        unitErrors.units = 'An assigned chassis number cannot be cleared.';
+        break;
+      }
+      if (chassis) {
+        if (chassisNumbers.has(chassis) || vehicles.some(vehicle =>
+          vehicle.id !== unit.vehicleId && vehicle.chassisVin.toUpperCase() === chassis
+        )) {
+          unitErrors.units = `Chassis number "${chassis}" is already assigned.`;
+          break;
+        }
+        chassisNumbers.add(chassis);
+      }
+
+      const battery = unit.batterySerial.trim().toUpperCase();
+      if (battery) {
+        if (batterySerials.has(battery) || vehicles.some(vehicle =>
+          vehicle.id !== unit.vehicleId && vehicle.batterySerial.toUpperCase() === battery
+        )) {
+          unitErrors.unitsBS = `Battery serial "${battery}" is already assigned.`;
+          break;
+        }
+        batterySerials.add(battery);
+      }
+    }
+    if (Object.keys(unitErrors).length) {
+      setErrors(unitErrors);
       return;
     }
+
     const cost = parseFloat(form.purchaseCostPerUnit);
-    if (isNaN(cost) || cost < 0) { setErrors({ submit: 'Purchase cost must be ₹0 or more.' }); return; }
     setFormLoading(true);
-    const res = await updateInventoryBatch(selectedBatch.id, {
-      modelNumber: form.modelNumber.trim(),
-      lightType: form.lightType,
-      companyName: form.companyName.trim(),
-      batteryCompanyName: form.batteryCompanyName.trim(),
-      hsnCode: form.hsnCode.trim(),
-      purchaseDate: form.purchaseDate,
-      purchaseCostPerUnit: cost,
-      invoiceNumber: form.invoiceNumber.trim(),
-      supplierName: form.supplierName.trim(),
-      batteryWarrantyMonths: parseInt(form.batteryWarrantyMonths) || 36,
-      stockNotes: form.stockNotes.trim()
-    });
-    setFormLoading(false);
-    if (res.success) {
+    try {
+      const res = await updateInventoryBatch(selectedBatch.id, {
+        modelNumber: form.modelNumber.trim(),
+        lightType: form.lightType,
+        companyName: form.companyName.trim(),
+        batteryCompanyName: form.batteryCompanyName.trim(),
+        hsnCode: form.hsnCode.trim(),
+        purchaseDate: form.purchaseDate,
+        purchaseCostPerUnit: cost,
+        invoiceNumber: form.invoiceNumber.trim(),
+        supplierName: form.supplierName.trim(),
+        batteryWarrantyMonths: parseInt(form.batteryWarrantyMonths) || 36,
+        stockNotes: form.stockNotes.trim()
+      });
+      if (!res.success) {
+        setErrors({ submit: res.message || 'Failed to update batch.' });
+        return;
+      }
+
+      const hasUnitDetails = (unit: UnitRow) =>
+        Boolean(unit.chassisNumber.trim() || unit.batterySerial.trim() || unit.color.trim() || unit.motorNumber.trim());
+      const unregisteredRows = form.units.filter(unit => !unit.vehicleId && hasUnitDetails(unit));
+      let unitsToSave = form.units;
+      let currentVehicles = vehicles;
+
+      if (unregisteredRows.length) {
+        const registerResponse = await fetch(`${BACKEND}/api/inventory-batches/${selectedBatch.id}/register-missing-units`, {
+          method: 'POST',
+          credentials: 'include'
+        });
+        const registerResult = await registerResponse.json();
+        if (!registerResponse.ok || !registerResult.success) {
+          throw new Error(`Batch details were saved, but missing stock units could not be registered: ${registerResult.message || 'Registration failed.'}`);
+        }
+
+        const unitsResponse = await fetch(`${BACKEND}/api/inventory-batches/${selectedBatch.id}`, { credentials: 'include' });
+        const unitsResult = await unitsResponse.json();
+        if (!unitsResponse.ok || !unitsResult.success) {
+          throw new Error(`Batch details were saved, but the new unit records could not be loaded: ${unitsResult.message || 'Loading failed.'}`);
+        }
+        const refreshedUnits: Vehicle[] = unitsResult.data.units || [];
+        const knownVehicleIds = new Set(vehicles.map(vehicle => vehicle.id));
+        const newlyAvailableUnits = refreshedUnits.filter(vehicle =>
+          vehicle.status === 'Available' && !knownVehicleIds.has(vehicle.id)
+        );
+        let nextNewUnit = 0;
+        unitsToSave = form.units.map(unit => {
+          if (unit.vehicleId || !hasUnitDetails(unit)) return unit;
+          const createdUnit = newlyAvailableUnits[nextNewUnit];
+          if (!createdUnit) return unit;
+          nextNewUnit += 1;
+          return { ...unit, vehicleId: createdUnit.id };
+        });
+        if (unitsToSave.some(unit => !unit.vehicleId && hasUnitDetails(unit))) {
+          throw new Error('Batch details were saved, but a vehicle record could not be created for one or more units.');
+        }
+        currentVehicles = [...vehicles, ...newlyAvailableUnits];
+      }
+
+      for (let index = 0; index < unitsToSave.length; index += 1) {
+        const unit = unitsToSave[index];
+        if (!unit.vehicleId) continue;
+        const currentVehicle = currentVehicles.find(vehicle => vehicle.id === unit.vehicleId);
+        if (!currentVehicle) {
+          throw new Error(`Batch details were saved, but unit ${index + 1} could not be found.`);
+        }
+
+        const updates: Partial<Vehicle> = {};
+        const chassis = unit.chassisNumber.trim().toUpperCase();
+        const currentChassisPending = currentVehicle.chassisPending || currentVehicle.chassisVin.startsWith('PENDING-');
+        if (chassis && (currentChassisPending || chassis !== currentVehicle.chassisVin.toUpperCase())) {
+          updates.chassisVin = chassis;
+        }
+        const batterySerial = unit.batterySerial.trim().toUpperCase();
+        if (batterySerial !== (currentVehicle.batterySerial || '').toUpperCase()) updates.batterySerial = batterySerial;
+        if (unit.color !== (currentVehicle.color || '')) updates.color = unit.color;
+        if (unit.motorNumber !== (currentVehicle.motorNumber || '')) updates.motorNumber = unit.motorNumber;
+        if (!Object.keys(updates).length) continue;
+
+        const response = await fetch(`${BACKEND}/api/vehicles/${unit.vehicleId}`, {
+          method: 'PUT',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updates)
+        });
+        const result = await response.json();
+        if (!response.ok || !result.success) {
+          throw new Error(`Batch details were saved, but unit ${index + 1} could not be updated: ${result.message || 'Update failed.'}`);
+        }
+      }
+
+      const syncResult = await syncFromMongoDB();
+      if (!syncResult.success) {
+        throw new Error(`Changes were saved, but refreshing inventory failed: ${syncResult.message}`);
+      }
       showToast('✅ Inventory batch updated successfully!', 'success');
       closeModal();
-    } else {
-      setErrors({ submit: res.message || 'Failed to update batch.' });
+    } catch (error) {
+      setErrors({ submit: error instanceof Error ? error.message : 'Failed to update inventory batch.' });
+    } finally {
+      setFormLoading(false);
     }
   };
 
@@ -432,27 +682,215 @@ export default function InventoryView() {
 
   // ── CSV Export ─────────────────────────────────────────────────────────
   const handleExport = () => {
-    if (!inventoryBatches.length) { showToast('No inventory data to export.', 'error'); return; }
-    const headers = ['Batch Code', 'Model', 'Light Type', 'Company', 'Battery Co.', 'HSN Code', 'Purchase Date', 'Cost/Unit (₹)', 'Quantity', 'Available', 'Sold', 'Invoice No.', 'Supplier', 'Status'];
-    const rows = inventoryBatches.map(b => [
-      b.batchCode, b.modelNumber, b.lightType, b.companyName, b.batteryCompanyName,
-      b.hsnCode, b.purchaseDate, b.purchaseCostPerUnit, b.quantity,
-      b.availableQty, b.soldQty, b.invoiceNumber, b.supplierName, b.status
-    ].map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(','));
-    const csv = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows].join('\n');
-    const link = document.createElement('a');
-    link.href = encodeURI(csv);
-    link.download = `Inventory_Batches_${new Date().toISOString().slice(0, 10)}.csv`;
-    link.click();
+    if (!inventoryBatches.length) {
+      exportToCSV([{
+        batchCode: '',
+        modelNumber: '',
+        lightType: 'Single Light',
+        companyName: '',
+        batteryCompanyName: '',
+        hsnCode: '',
+        purchaseDate: '',
+        purchaseCostPerUnit: '',
+        quantity: '',
+        availableQty: '',
+        soldQty: '',
+        invoiceNumber: '',
+        supplierName: '',
+        batteryWarrantyMonths: 36,
+        stockNotes: '',
+        unitsJson: '[]'
+      }], 'Inventory_Batches_Template');
+      return;
+    }
+    exportToCSV(inventoryBatches.map(batch => ({
+      batchCode: batch.batchCode,
+      modelNumber: batch.modelNumber,
+      lightType: batch.lightType,
+      companyName: batch.companyName,
+      batteryCompanyName: batch.batteryCompanyName,
+      hsnCode: batch.hsnCode,
+      purchaseDate: batch.purchaseDate,
+      purchaseCostPerUnit: batch.purchaseCostPerUnit,
+      quantity: batch.quantity,
+      availableQty: batch.availableQty,
+      soldQty: batch.soldQty,
+      invoiceNumber: batch.invoiceNumber,
+      supplierName: batch.supplierName,
+      batteryWarrantyMonths: batch.batteryWarrantyMonths,
+      stockNotes: batch.stockNotes,
+      unitsJson: JSON.stringify(vehicles.filter(vehicle => vehicle.inventoryBatchId === batch.id).map(vehicle => ({
+        chassisNumber: vehicle.chassisPending ? '' : vehicle.chassisVin,
+        batterySerial: vehicle.batterySerial,
+        color: vehicle.color,
+        motorNumber: vehicle.motorNumber
+      })))
+    })), 'Inventory_Batches');
+  };
+
+  const handleImport = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+
+    let importedCount = 0;
+    setIsImporting(true);
+    try {
+      const parsed = parseCSV(await file.text());
+      if (parsed.length < 2) throw new Error('The CSV must include a header and at least one inventory batch.');
+      const [headers, ...rows] = parsed;
+      const batches = rows.map((row, index) => {
+        const rowNumber = index + 2;
+        const modelNumber = csvColumn(headers, row, 'modelNumber', 'Model', 'Model Number', 'Model Name', 'Scooty Model', 'Vehicle Model', 'Product Name');
+        const companyName = csvColumn(headers, row, 'companyName', 'Company', 'Company Name', 'Brand', 'Brand / Company', 'Manufacturer');
+        const rawPurchaseDate = csvColumn(headers, row, 'purchaseDate', 'Purchase Date', 'Date');
+        const purchaseDate = parseInventoryDate(rawPurchaseDate);
+        const rawPurchaseCost = csvColumn(headers, row, 'purchaseCostPerUnit', 'Cost/Unit (₹)', 'Purchase Cost', 'Purchase Cost (₹)', 'Purchase Price', 'Cost Per Unit', 'Unit Cost');
+        const purchaseCostPerUnit = parseInventoryNumber(rawPurchaseCost);
+        const rawQuantity = csvColumn(headers, row, 'quantity', 'Quantity', 'Qty', 'Units');
+        const quantity = parseInventoryNumber(rawQuantity);
+        const rawLightType = csvColumn(headers, row, 'lightType', 'Light Type');
+        const lightType = !rawLightType
+          ? 'Single Light'
+          : /double/i.test(rawLightType)
+            ? 'Double Light'
+            : /single/i.test(rawLightType)
+              ? 'Single Light'
+              : rawLightType;
+        const rawWarranty = csvColumn(headers, row, 'batteryWarrantyMonths');
+        const batteryWarrantyMonths = rawWarranty ? Number(rawWarranty) : 36;
+        const rawUnits = csvColumn(headers, row, 'unitsJson', 'Units JSON');
+        let units: UnitRow[] = [];
+
+        if (rawUnits) {
+          try {
+            units = JSON.parse(rawUnits);
+          } catch {
+            throw new Error(`Row ${rowNumber}: Units JSON is invalid. Leave it blank or provide a JSON array.`);
+          }
+        } else {
+          const chassisNumber = csvColumn(headers, row, 'chassisNumber', 'Chassis Number', 'Chassis No', 'Chassis/VIN', 'chassisVin', 'VIN');
+          if (chassisNumber) {
+            units = [{
+              chassisNumber,
+              batterySerial: csvColumn(headers, row, 'batterySerial', 'Battery Serial', 'Battery Serial Number'),
+              color: csvColumn(headers, row, 'color', 'Color'),
+              motorNumber: csvColumn(headers, row, 'motorNumber', 'Motor Number', 'Motor No', 'Motor Number')
+            }];
+          }
+        }
+
+        if (!modelNumber) throw new Error(`Row ${rowNumber}: model is empty. Add a Model or Model Name column.`);
+        if (!companyName) throw new Error(`Row ${rowNumber}: company is empty. Add a Company or Brand column.`);
+        if (!purchaseDate) throw new Error(`Row ${rowNumber}: purchase date "${rawPurchaseDate}" is invalid. Use YYYY-MM-DD or DD/MM/YYYY.`);
+        if (!rawPurchaseCost || !Number.isFinite(purchaseCostPerUnit) || purchaseCostPerUnit <= 0) {
+          throw new Error(`Row ${rowNumber}: purchase cost "${rawPurchaseCost}" is invalid. Enter a positive amount.`);
+        }
+        if (!rawQuantity || !Number.isInteger(quantity) || quantity < 1) {
+          throw new Error(`Row ${rowNumber}: quantity "${rawQuantity}" must be a positive whole number.`);
+        }
+        if (!Number.isInteger(batteryWarrantyMonths) || batteryWarrantyMonths < 1) {
+          throw new Error(`Row ${rowNumber}: battery warranty must be a positive whole number of months.`);
+        }
+        if (!['Single Light', 'Double Light'].includes(lightType)) {
+          throw new Error(`Row ${rowNumber}: light type "${rawLightType}" must be Single Light or Double Light.`);
+        }
+        if (!Array.isArray(units)) {
+          throw new Error(`Row ${rowNumber}: unit details must be a JSON array or provided in a Chassis Number column.`);
+        }
+        if (units.length > quantity || units.some(unit =>
+          !unit || typeof unit !== 'object' ||
+          typeof unit.chassisNumber !== 'string' ||
+          (unit.batterySerial !== undefined && typeof unit.batterySerial !== 'string') ||
+          (unit.color !== undefined && typeof unit.color !== 'string') ||
+          (unit.motorNumber !== undefined && typeof unit.motorNumber !== 'string')
+        )) {
+          throw new Error(`Row ${rowNumber}: unit details must be valid and cannot exceed the batch quantity.`);
+        }
+
+        return {
+          rowNumber,
+          modelNumber,
+          lightType,
+          companyName,
+          batteryCompanyName: csvColumn(headers, row, 'batteryCompanyName', 'Battery Co.'),
+          hsnCode: csvColumn(headers, row, 'hsnCode', 'HSN Code'),
+          purchaseDate,
+          purchaseCostPerUnit,
+          quantity,
+          invoiceNumber: csvColumn(headers, row, 'invoiceNumber', 'Invoice No.'),
+          supplierName: csvColumn(headers, row, 'supplierName', 'Supplier'),
+          batteryWarrantyMonths,
+          stockNotes: csvColumn(headers, row, 'stockNotes'),
+          units
+        };
+      });
+
+      const importedChassis = new Set<string>();
+      const importedBatteries = new Set<string>();
+      const pendingChassisCount = batches.reduce((total, batch) =>
+        total + batch.quantity - batch.units.filter(unit => unit.chassisNumber.trim()).length, 0);
+      for (const batch of batches) {
+        for (const unit of batch.units) {
+          const chassis = unit.chassisNumber.trim().toUpperCase();
+          const battery = (unit.batterySerial || '').trim().toUpperCase();
+          if (!chassis) continue;
+          if (vehicles.some(vehicle => vehicle.chassisVin.toUpperCase() === chassis) || importedChassis.has(chassis)) {
+            throw new Error(`Row ${batch.rowNumber}: chassis number "${chassis}" already exists.`);
+          }
+          if (battery && (vehicles.some(vehicle => vehicle.batterySerial.toUpperCase() === battery) || importedBatteries.has(battery))) {
+            throw new Error(`Row ${batch.rowNumber}: battery serial "${battery}" already exists.`);
+          }
+          importedChassis.add(chassis);
+          if (battery) importedBatteries.add(battery);
+        }
+      }
+
+      for (const batch of batches) {
+        const { rowNumber, ...data } = batch;
+        const result = await addInventoryBatch(data);
+        if (!result.success) throw new Error(`Row ${rowNumber}: ${result.message || 'Could not create inventory batch.'}`);
+        importedCount += 1;
+      }
+      const syncResult = await syncFromMongoDB();
+      if (!syncResult.success) {
+        showToast(`Imported ${importedCount} batch(es), but refreshing inventory failed: ${syncResult.message}`, 'error');
+        return;
+      }
+      showToast(`Imported ${batches.length} batch(es) successfully.${pendingChassisCount ? ` ${pendingChassisCount} unit(s) are available for sale with chassis assignment pending.` : ''}`, 'success');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Inventory CSV import failed.';
+      if (importedCount) {
+        const syncResult = await syncFromMongoDB();
+        showToast(`Imported ${importedCount} batch(es) before stopping: ${message}${syncResult.success ? '' : ` Inventory refresh failed: ${syncResult.message}`}`, 'error');
+      } else {
+        showToast(message, 'error');
+      }
+    } finally {
+      setIsImporting(false);
+    }
   };
 
   // ── Filtering / Pagination ─────────────────────────────────────────────
   const companies = Array.from(new Set(inventoryBatches.map(b => b.companyName).filter(Boolean)));
+  const vehiclesByBatch = new Map<string, Vehicle[]>();
+  vehicles.forEach(vehicle => {
+    if (!vehicle.inventoryBatchId) return;
+    const batchVehicles = vehiclesByBatch.get(vehicle.inventoryBatchId) || [];
+    batchVehicles.push(vehicle);
+    vehiclesByBatch.set(vehicle.inventoryBatchId, batchVehicles);
+  });
+  const getBatchVehicles = (batchId: string) => vehiclesByBatch.get(batchId) || [];
+  const getChassisLabel = (vehicle: Vehicle) =>
+    vehicle.chassisPending || vehicle.chassisVin.startsWith('PENDING-')
+      ? 'Pending assignment'
+      : vehicle.chassisVin;
 
   const filtered = inventoryBatches.filter(b => {
     const q = searchTerm.toLowerCase();
     const matchSearch = !q || [b.modelNumber, b.batchCode, b.companyName, b.hsnCode, b.invoiceNumber, b.supplierName]
-      .some(s => (s || '').toLowerCase().includes(q));
+      .some(s => (s || '').toLowerCase().includes(q)) ||
+      getBatchVehicles(b.id).some(vehicle => vehicle.chassisVin.toLowerCase().includes(q));
     const matchStatus = filterStatus === 'All' || b.status === filterStatus;
     const matchCompany = filterCompany === 'All' || b.companyName === filterCompany;
     return matchSearch && matchStatus && matchCompany;
@@ -489,6 +927,11 @@ export default function InventoryView() {
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
+          <input ref={importInputRef} type="file" accept=".csv,text/csv" className="hidden" onChange={handleImport} />
+          <button onClick={() => importInputRef.current?.click()} disabled={isImporting} title="Import CSV with one unitsJson entry per unit, including a unique chassisNumber."
+            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold shadow-sm transition disabled:opacity-50">
+            <Upload className="h-3.5 w-3.5" />Import CSV
+          </button>
           <button onClick={handleExport}
             className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold shadow-sm transition">
             <Download className="h-3.5 w-3.5" />Export CSV
@@ -572,6 +1015,7 @@ export default function InventoryView() {
                 <th className="p-3.5">Company</th>
                 <th className="p-3.5">Battery Co.</th>
                 <th className="p-3.5 text-center">Stock</th>
+                <th className="p-3.5">Chassis No.</th>
                 <th className="p-3.5">HSN Code</th>
                 <th className="p-3.5">Purchase Date</th>
                 <th className="p-3.5 text-right">Cost/Unit</th>
@@ -600,6 +1044,20 @@ export default function InventoryView() {
                       <span className="text-[10px] text-slate-400">of {batch.quantity} total</span>
                       {(batch.soldQty || 0) > 0 && <span className="text-[10px] text-amber-700 font-semibold">{batch.soldQty} sold</span>}
                     </div>
+                  </td>
+                  <td className="p-3.5">
+                    {getBatchVehicles(batch.id).length > 0 ? (
+                      <div className="flex max-h-20 max-w-52 flex-wrap gap-1 overflow-y-auto">
+                        {getBatchVehicles(batch.id).map(vehicle => {
+                          const pending = vehicle.chassisPending || vehicle.chassisVin.startsWith('PENDING-');
+                          return (
+                            <span key={vehicle.id} className={`rounded-md border px-1.5 py-0.5 font-mono text-[10px] ${pending ? 'border-amber-200 bg-amber-50 text-amber-700' : 'border-slate-200 bg-slate-50 text-slate-700'}`}>
+                              {getChassisLabel(vehicle)}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    ) : <span className="text-slate-300">Not registered</span>}
                   </td>
                   <td className="p-3.5 font-mono text-slate-700">{batch.hsnCode || <span className="text-slate-300">—</span>}</td>
                   <td className="p-3.5 text-slate-600">{formatDate(batch.purchaseDate)}</td>
@@ -632,7 +1090,7 @@ export default function InventoryView() {
                 </tr>
               )) : (
                 <tr>
-                  <td colSpan={10} className="p-12 text-center">
+                  <td colSpan={11} className="p-12 text-center">
                     <Package className="h-10 w-10 text-slate-200 mx-auto mb-3" />
                     <p className="text-slate-400 font-medium text-sm">No inventory batches found</p>
                     <p className="text-slate-300 text-xs mt-1">
@@ -670,6 +1128,21 @@ export default function InventoryView() {
               <div><span className="text-slate-400">Light Type</span><p className="font-semibold text-slate-800 mt-0.5">{batch.lightType}</p></div>
               <div><span className="text-slate-400">Stock</span><p className="font-bold text-emerald-700 mt-0.5">{batch.availableQty ?? batch.quantity} / {batch.quantity}</p></div>
               <div><span className="text-slate-400">Cost/Unit</span><p className="font-bold text-slate-900 mt-0.5">{formatCurrency(batch.purchaseCostPerUnit)}</p></div>
+              <div className="col-span-2">
+                <span className="text-slate-400">Chassis No.</span>
+                {getBatchVehicles(batch.id).length > 0 ? (
+                  <div className="mt-1 flex max-h-20 flex-wrap gap-1 overflow-y-auto">
+                    {getBatchVehicles(batch.id).map(vehicle => {
+                      const pending = vehicle.chassisPending || vehicle.chassisVin.startsWith('PENDING-');
+                      return (
+                        <span key={vehicle.id} className={`rounded-md border px-1.5 py-0.5 font-mono text-[10px] ${pending ? 'border-amber-200 bg-amber-50 text-amber-700' : 'border-slate-200 bg-slate-50 text-slate-700'}`}>
+                          {getChassisLabel(vehicle)}
+                        </span>
+                      );
+                    })}
+                  </div>
+                ) : <p className="mt-0.5 text-slate-300">Not registered</p>}
+              </div>
               <div><span className="text-slate-400">HSN Code</span><p className="font-mono text-slate-700 mt-0.5">{batch.hsnCode || '—'}</p></div>
               <div><span className="text-slate-400">Date</span><p className="text-slate-700 mt-0.5">{formatDate(batch.purchaseDate)}</p></div>
             </div>
@@ -811,7 +1284,9 @@ export default function InventoryView() {
                     <Field label="Quantity (units in this purchase)" error={errors.quantity} required>
                       <input type="number" min={1} step={1} value={form.quantity}
                         onChange={e => setForm(f => ({ ...f, quantity: e.target.value }))}
+                        disabled={modalMode === 'edit'}
                         className={`${inputCls} font-mono font-bold ${errors.quantity ? inputErr : ''}`} />
+                      {modalMode === 'edit' && <p className="mt-1 text-[10px] text-slate-400">Quantity follows registered stock. Use “+ Stock” to increase it.</p>}
                     </Field>
 
                     <Field label="Purchase Invoice Number">
@@ -834,8 +1309,8 @@ export default function InventoryView() {
                   </div>
                 </div>
 
-                {/* ── Section 3: Individual Unit Details (Add mode only) ────── */}
-                {modalMode === 'add' && parsedQty(form.quantity) > 0 && (
+                {/* ── Section 3: Individual Unit Details ──────────────────── */}
+                {(modalMode === 'add' || modalMode === 'edit') && parsedQty(form.quantity) > 0 && (
                   <div>
                     <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-3 flex items-center gap-1.5">
                       <Hash className="h-3.5 w-3.5" />Individual Unit Details
@@ -852,7 +1327,7 @@ export default function InventoryView() {
                         qty={parsedQty(form.quantity)}
                         modelNumber={form.modelNumber} />
                       <p className="text-[10px] text-amber-700 mt-2">
-                        💡 Each chassis number must be globally unique. Battery serial must also be unique. Leave blank if not available at purchase time.
+                        💡 Each chassis number must be globally unique. Battery serial must also be unique. Leave blank if not available yet.
                       </p>
                     </div>
                   </div>
@@ -1004,32 +1479,79 @@ export default function InventoryView() {
                       <RefreshCw className="h-4 w-4 animate-spin" />Loading unit details…
                     </div>
                   ) : batchUnits.length === 0 ? (
-                    <div className="py-4 text-center text-xs text-slate-400 border border-slate-100 rounded-xl">
-                      No individual unit records found. Units may not have been registered with chassis numbers at time of purchase.
+                    <div className="py-4 text-center text-xs text-slate-500 border border-slate-100 rounded-xl">
+                      <p>No individual unit records found for this batch.</p>
+                      {(selectedBatch.availableQty ?? selectedBatch.quantity) > 0 && (
+                        <button
+                          onClick={registerMissingUnits}
+                          disabled={registeringMissingUnits}
+                          className="mt-3 rounded-lg bg-amber-500 px-3 py-2 text-xs font-bold text-slate-950 disabled:opacity-50"
+                        >
+                          {registeringMissingUnits ? 'Registering units…' : 'Make stock available for sales'}
+                        </button>
+                      )}
                     </div>
                   ) : (
-                    <div className="rounded-xl border border-slate-200 overflow-hidden">
-                      <div className="grid grid-cols-[28px_1fr_1fr_1fr_80px] bg-slate-100 text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                        <div className="p-2 text-center">#</div>
-                        <div className="p-2">Chassis / VIN</div>
-                        <div className="p-2">Battery Serial</div>
-                        <div className="p-2">Color</div>
-                        <div className="p-2 text-center">Status</div>
-                      </div>
-                      <div className="divide-y divide-slate-100 max-h-60 overflow-y-auto">
-                        {batchUnits.map((u, i) => (
-                          <div key={u.id} className="grid grid-cols-[28px_1fr_1fr_1fr_80px] items-center text-xs">
-                            <div className="p-2 text-center text-[10px] font-mono text-slate-400">{i + 1}</div>
-                            <div className="p-2 font-mono font-bold text-slate-800">{u.chassisVin}</div>
-                            <div className="p-2 font-mono text-slate-600">{u.batterySerial || '—'}</div>
-                            <div className="p-2 text-slate-600">{u.color || '—'}</div>
-                            <div className="p-2 text-center">
-                              <span className={`inline-flex px-2 py-0.5 rounded-full text-[10px] font-bold border ${statusBadge(u.status)}`}>
-                                {u.status}
-                              </span>
-                            </div>
+                    <div className="space-y-2">
+                      {batchUnits.filter(unit => unit.status === 'Available').length < (selectedBatch.availableQty ?? selectedBatch.quantity) && (
+                        <button
+                          onClick={registerMissingUnits}
+                          disabled={registeringMissingUnits}
+                          className="rounded-lg bg-amber-500 px-3 py-2 text-xs font-bold text-slate-950 disabled:opacity-50"
+                        >
+                          {registeringMissingUnits ? 'Registering units…' : 'Make missing stock available for sales'}
+                        </button>
+                      )}
+                      <div className="rounded-xl border border-slate-200 overflow-x-auto">
+                        <div className="min-w-[700px]">
+                          <div className="grid grid-cols-[28px_2fr_1fr_1fr_80px] bg-slate-100 text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                            <div className="p-2 text-center">#</div>
+                            <div className="p-2">Chassis / VIN</div>
+                            <div className="p-2">Battery Serial</div>
+                            <div className="p-2">Color</div>
+                            <div className="p-2 text-center">Status</div>
                           </div>
-                        ))}
+                          <div className="divide-y divide-slate-100 max-h-60 overflow-y-auto">
+                            {batchUnits.map((u, i) => {
+                              const chassisPending = u.chassisPending || u.chassisVin.startsWith('PENDING-');
+                              return (
+                                <div key={u.id} className="grid grid-cols-[28px_2fr_1fr_1fr_80px] items-center text-xs">
+                                  <div className="p-2 text-center text-[10px] font-mono text-slate-400">{i + 1}</div>
+                                  <div className="p-2">
+                                    {chassisPending ? (
+                                      <div className="flex items-center gap-1.5">
+                                        <input
+                                          type="text"
+                                          value={chassisAssignments[u.id] || ''}
+                                          onChange={event => setChassisAssignments(current => ({ ...current, [u.id]: event.target.value.toUpperCase() }))}
+                                          placeholder="Assign real chassis"
+                                          aria-label={`Assign chassis number to unit ${i + 1}`}
+                                          className="min-w-0 flex-1 rounded-lg border border-slate-200 px-2 py-1 font-mono text-[11px] uppercase"
+                                        />
+                                        <button
+                                          onClick={() => assignChassisNumber(u)}
+                                          disabled={savingChassisId === u.id}
+                                          className="rounded-lg bg-amber-500 px-2 py-1 text-[10px] font-bold text-slate-950 disabled:opacity-50"
+                                        >
+                                          {savingChassisId === u.id ? 'Saving' : 'Assign'}
+                                        </button>
+                                      </div>
+                                    ) : (
+                                      <span className="font-mono font-bold text-slate-800">{u.chassisVin}</span>
+                                    )}
+                                  </div>
+                                  <div className="p-2 font-mono text-slate-600">{u.batterySerial || '—'}</div>
+                                  <div className="p-2 text-slate-600">{u.color || '—'}</div>
+                                  <div className="p-2 text-center">
+                                    <span className={`inline-flex px-2 py-0.5 rounded-full text-[10px] font-bold border ${statusBadge(u.status)}`}>
+                                      {u.status}
+                                    </span>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
                       </div>
                     </div>
                   )}

@@ -87,7 +87,7 @@ export default function InvoiceModal() {
               <p className="font-bold text-sm text-slate-900">{vehicle?.brand} {vehicle?.model} - {vehicle?.variant}</p>
               <p className="text-slate-600">Color: <span className="font-medium text-slate-800">{vehicle?.color}</span> | Reg No: <span className="font-mono font-bold text-slate-900">{sale.registrationNumber || 'Under RTO Process'}</span></p>
               <div className="mt-2 space-y-0.5 font-mono text-[11px]">
-                <p><span className="text-slate-500">Chassis/VIN:</span> <strong className="text-slate-900">{vehicle?.chassisVin}</strong></p>
+                <p><span className="text-slate-500">Chassis/VIN:</span> <strong className="text-slate-900">{vehicle?.chassisPending ? 'Pending assignment' : vehicle?.chassisVin || '—'}</strong></p>
                 <p><span className="text-slate-500">Motor No:</span> <strong className="text-slate-900">{vehicle?.motorNumber}</strong></p>
                 <p><span className="text-slate-500">Battery Serial:</span> <strong className="text-slate-900">{vehicle?.batterySerial}</strong></p>
               </div>
