@@ -87,18 +87,25 @@ export async function pushDatabaseToMongoDB(localDb: CRMDatabase): Promise<{ suc
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(localDb)
     });
-    const json = await res.json();
-    if (json.success) {
+    const responseText = await res.text();
+    let json: { success?: boolean; message?: string };
+    try {
+      json = JSON.parse(responseText);
+    } catch {
+      throw new Error(responseText.trim() || `Backend returned HTTP ${res.status} without a JSON response.`);
+    }
+    if (res.ok && json.success) {
       return {
         success: true,
         message: 'Successfully synchronized all showroom records to MongoDB Atlas!'
       };
     }
-    throw new Error(json.message || 'Failed to push records');
-  } catch (err: any) {
+    throw new Error(json.message || `Backend returned HTTP ${res.status} while saving CRM records.`);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
     return {
       success: false,
-      message: `MongoDB sync error: ${err.message}`
+      message: `MongoDB sync error: ${message}`
     };
   }
 }

@@ -106,13 +106,13 @@ export default function LeadsView() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <button
+          {/* <button
             onClick={() => exportToCSV(leads, 'Leads_Enquiries_Report')}
             className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold shadow-2xs transition"
           >
             <Download className="h-4 w-4" />
             Export CSV
-          </button>
+          </button> */}
           <button
             onClick={() => setIsAddLeadOpen(true)}
             className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold shadow-md shadow-blue-500/20 transition cursor-pointer"

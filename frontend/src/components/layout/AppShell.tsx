@@ -7,6 +7,7 @@ import InvoiceModal from '@/components/common/InvoiceModal';
 import JobCardModal from '@/components/common/JobCardModal';
 import PaymentReceiptModal from '@/components/common/PaymentReceiptModal';
 import QuickActionModal from '@/components/common/QuickActionModal';
+import ModuleDataTransfer from '@/components/common/ModuleDataTransfer';
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   return (
@@ -19,6 +20,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         <Header />
 
         <main className="flex-1 p-6 lg:p-8 max-w-7xl w-full mx-auto">
+          <ModuleDataTransfer />
           {children}
         </main>
       </div>

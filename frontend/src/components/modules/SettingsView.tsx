@@ -54,21 +54,18 @@ export default function SettingsView() {
     setFormData({ ...formData, serviceIntervals: updated });
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
+    if (!window.confirm('Restore this full CRM backup? Current CRM data will be replaced.')) return;
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const text = event.target?.result as string;
-      const success = importDatabaseJSON(text);
-      if (success) {
-        alert('CRM Database restored successfully from backup JSON!');
-      } else {
-        alert('Failed to parse database backup file. Ensure it is a valid JSON file.');
-      }
-    };
-    reader.readAsText(file);
+    try {
+      const result = await importDatabaseJSON(await file.text());
+      alert(result.message);
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'Could not read the CRM backup file.');
+    }
   };
 
   return (

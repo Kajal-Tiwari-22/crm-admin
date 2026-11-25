@@ -10,7 +10,8 @@ import {
   InventoryBatch, InventoryUnit
 } from '@/types/crm';
 import {
-  CRMDatabase, getDefaultDatabase, loadDatabase, saveDatabase, resetDatabaseToDefault, loadSampleDemoData
+  CRMDatabase, getDefaultDatabase, loadDatabase, saveDatabase, resetDatabaseToDefault, loadSampleDemoData,
+  ImportableCRMCollection, ImportedCRMRecord
 } from '@/lib/storage';
 import {
   pushDatabaseToMongoDB, pullDatabaseFromMongoDB, dispatchWhatsAppReminder, getMongoSocket, resetMongoDBDatabase, wipeCleanMongoDB
@@ -174,7 +175,11 @@ interface CRMContextType {
   
   resetDatabase: () => void;
   exportDatabaseJSON: () => void;
-  importDatabaseJSON: (jsonStr: string) => boolean;
+  importDatabaseJSON: (jsonStr: string) => Promise<{ success: boolean; message: string }>;
+  importModuleRecords: <K extends ImportableCRMCollection>(
+    collection: K,
+    records: ImportedCRMRecord<K>[]
+  ) => Promise<{ success: boolean; message: string }>;
 
   // KPI Calculations
   kpis: {
@@ -201,6 +206,43 @@ interface CRMContextType {
 
 const CRMContext = createContext<CRMContextType | undefined>(undefined);
 const API_BASE = '/api';
+
+function isCRMDatabase(value: unknown): value is CRMDatabase {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  const collectionNames: (keyof CRMDatabase)[] = [
+    'vehicles',
+    'inventoryBatches',
+    'customers',
+    'sales',
+    'services',
+    'emiSchedules',
+    'reminders',
+    'leads',
+    'spareParts',
+    'suppliers',
+    'purchaseOrders',
+    'warrantyInsurance',
+    'expenses',
+    'staff',
+    'auditLogs'
+  ];
+  const hasValidCollections = collectionNames.every(collection =>
+    Array.isArray(candidate[collection]) &&
+    (candidate[collection] as unknown[]).every(record =>
+      Boolean(record) &&
+      typeof record === 'object' &&
+      !Array.isArray(record) &&
+      typeof (record as { id?: unknown }).id === 'string' &&
+      Boolean((record as { id: string }).id.trim())
+    )
+  );
+  const settings = candidate.settings;
+  return hasValidCollections &&
+    Boolean(settings) &&
+    typeof settings === 'object' &&
+    !Array.isArray(settings);
+}
 
 export function CRMProvider({ children }: { children: ReactNode }) {
   const [db, setDb] = useState<CRMDatabase | null>(null);
@@ -1316,19 +1358,68 @@ export function CRMProvider({ children }: { children: ReactNode }) {
     URL.revokeObjectURL(url);
   };
 
-  const importDatabaseJSON = (jsonStr: string): boolean => {
+  const importDatabaseJSON = async (jsonStr: string): Promise<{ success: boolean; message: string }> => {
     try {
-      const parsed = JSON.parse(jsonStr) as CRMDatabase;
-      if (!parsed.vehicles || !parsed.customers) {
-        throw new Error('Invalid format');
+      const parsed: unknown = JSON.parse(jsonStr);
+      if (!isCRMDatabase(parsed)) {
+        return { success: false, message: 'Invalid backup: required CRM collections are missing or malformed.' };
       }
+
+      const syncResult = await pushDatabaseToMongoDB(parsed);
+      if (!syncResult.success) {
+        return { success: false, message: `Backup was not restored: ${syncResult.message}` };
+      }
+
       setDb(parsed);
-      saveDatabase(parsed);
       addAuditLog('IMPORT_BACKUP', 'System', 'Imported CRM database from JSON backup file');
-      return true;
-    } catch {
-      return false;
+      return { success: true, message: 'CRM backup restored and synchronized successfully.' };
+    } catch (error) {
+      return {
+        success: false,
+        message: error instanceof Error ? `Could not restore backup: ${error.message}` : 'Could not restore the CRM backup.'
+      };
     }
+  };
+
+  const importModuleRecords = async <K extends ImportableCRMCollection>(
+    collection: K,
+    records: ImportedCRMRecord<K>[]
+  ): Promise<{ success: boolean; message: string }> => {
+    if (!db) return { success: false, message: 'CRM data is not ready.' };
+    if (!records.length) return { success: false, message: 'The CSV does not contain any records to import.' };
+
+    const existingRecords = db[collection] as ImportedCRMRecord<K>[];
+    const knownIds = new Set(existingRecords.map(record => record.id));
+    let skippedCount = 0;
+    const newRecords = records.filter(record => {
+      const id = record.id.trim();
+      if (!id || knownIds.has(id)) {
+        skippedCount += 1;
+        return false;
+      }
+      knownIds.add(id);
+      return true;
+    });
+    if (!newRecords.length) {
+      return { success: true, message: `No new records imported; ${skippedCount} duplicate record(s) were skipped.` };
+    }
+
+    const updatedDatabase = {
+      ...db,
+      [collection]: [...existingRecords, ...newRecords]
+    } as CRMDatabase;
+    const syncResult = await pushDatabaseToMongoDB(updatedDatabase);
+    if (!syncResult.success) {
+      return { success: false, message: `Import was not saved: ${syncResult.message}` };
+    }
+
+    skipNextPush.current = true;
+    setDb(updatedDatabase);
+    addAuditLog('IMPORT_MODULE_CSV', collection, `Imported ${newRecords.length} record(s); skipped ${skippedCount} duplicate(s).`);
+    return {
+      success: true,
+      message: `Imported ${newRecords.length} record(s)${skippedCount ? `; skipped ${skippedCount} duplicate(s)` : ''}.`
+    };
   };
 
   // 12. MongoDB Atlas Real-time Sync
@@ -1545,6 +1636,7 @@ export function CRMProvider({ children }: { children: ReactNode }) {
         resetDatabase,
         exportDatabaseJSON,
         importDatabaseJSON,
+        importModuleRecords,
 
         isMongoConnected,
         mongoDatabaseName,

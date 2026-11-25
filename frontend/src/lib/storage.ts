@@ -31,6 +31,19 @@ export interface CRMDatabase {
   settings: ShowroomSettings;
 }
 
+export type ImportableCRMCollection =
+  | 'services'
+  | 'emiSchedules'
+  | 'reminders'
+  | 'leads'
+  | 'spareParts'
+  | 'suppliers'
+  | 'purchaseOrders'
+  | 'warrantyInsurance'
+  | 'expenses';
+
+export type ImportedCRMRecord<K extends ImportableCRMCollection> = CRMDatabase[K][number];
+
 export function getDefaultDatabase(): CRMDatabase {
   return {
     vehicles: [],
@@ -226,4 +239,75 @@ export function parseCSV(content: string): string[][] {
   row.push(value);
   if (row.some(cell => cell.trim())) rows.push(row);
   return rows;
+}
+
+export function parseCSVRecords<T extends { id: string }>(content: string, sample?: T): T[] {
+  const rows = parseCSV(content);
+  if (rows.length < 2) throw new Error('The CSV must include a header and at least one record.');
+
+  const [headers, ...dataRows] = rows;
+  const normalizeHeader = (header: string) => header.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!headers.some(header => normalizeHeader(header) === 'id')) {
+    throw new Error('The CSV must include the id column from the module export.');
+  }
+
+  const numericColumns = new Set([
+    'amount', 'amountdue', 'amountpaid', 'availableqty', 'batterywarrantymonths',
+    'budget', 'currentstock', 'deliveryattempts', 'discount', 'downpayment',
+    'duekm', 'exshowroomprice', 'financedamount', 'gstamount', 'interestannual',
+    'interestrateannual', 'insuranceamount', 'labourcharge', 'minstocklevel',
+    'monthlyemiamount', 'odometerreading', 'outstandingbalance', 'paidamount',
+    'partscharge', 'paymentday', 'purchasecostperunit', 'quantity', 'registrationamount',
+    'sellingprice', 'soldqty', 'taxamount', 'tenuremonths', 'totalamount',
+    'totalcustomerpayable', 'totalfinancedamount', 'totalpaidamount', 'totalpurchased',
+    'total', 'unitcost', 'unitprice', 'servicenumber'
+  ]);
+  const recordId = (row: string[], rowNumber: number): string => {
+    const idIndex = headers.findIndex(header => normalizeHeader(header) === 'id');
+    const id = (row[idIndex] || '').trim();
+    if (!id) throw new Error(`Row ${rowNumber}: id is required. Export the module CSV first to get valid record IDs.`);
+    return id;
+  };
+
+  return dataRows.map((row, rowIndex) => {
+    const record: Record<string, unknown> = {};
+    headers.forEach((header, columnIndex) => {
+      const rawValue = row[columnIndex] ?? '';
+      if (!rawValue.trim()) return;
+
+      const sampleValue = sample ? Reflect.get(sample, header) : undefined;
+      const normalizedHeader = normalizeHeader(header);
+      let value: unknown = rawValue;
+
+      if (normalizedHeader === 'servicenumber' && rawValue.trim().toLowerCase() === 'paid') {
+        value = 'Paid';
+      } else if (typeof sampleValue === 'number' || numericColumns.has(normalizedHeader)) {
+        const parsedNumber = Number(rawValue.replace(/,/g, '').trim());
+        if (!Number.isFinite(parsedNumber)) {
+          throw new Error(`Row ${rowIndex + 2}: "${header}" must be a valid number.`);
+        }
+        value = parsedNumber;
+      } else if (typeof sampleValue === 'boolean' || /^(true|false)$/i.test(rawValue.trim())) {
+        const normalizedValue = rawValue.trim().toLowerCase();
+        if (!['true', 'false'].includes(normalizedValue)) {
+          throw new Error(`Row ${rowIndex + 2}: "${header}" must be true or false.`);
+        }
+        value = normalizedValue === 'true';
+      } else if (
+        (sampleValue !== null && typeof sampleValue === 'object') ||
+        /^[\[{]/.test(rawValue.trim())
+      ) {
+        try {
+          value = JSON.parse(rawValue);
+        } catch {
+          throw new Error(`Row ${rowIndex + 2}: "${header}" must contain valid JSON.`);
+        }
+      }
+
+      record[header] = value;
+    });
+
+    record.id = recordId(row, rowIndex + 2);
+    return record as T;
+  });
 }
